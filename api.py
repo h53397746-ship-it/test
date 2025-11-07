@@ -18,10 +18,9 @@ CONFIG = {
     "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
     "BOT_TOKEN": os.getenv('BOT_TOKEN'),
     "DEFAULT_CHAT_ID": os.getenv('DEFAULT_CHAT_ID'),
-    "RESPONSE_TIMEOUT_SECONDS": 25 # How long to wait for Stripe after clicking 'Pay'
+    "RESPONSE_TIMEOUT_SECONDS": 25 
 }
 
-# A crucial check to prevent the app from starting without the required key
 if not CONFIG["RUN_LOCAL"] and not CONFIG["BROWSERLESS_API_KEY"]:
     raise ValueError("FATAL: You are in headless mode. BROWSERLESS_API_KEY must be set in your .env file or environment!")
 
@@ -59,9 +58,8 @@ def get_card(target_bin):
     parts = target_bin.split('|')
     return process_card_with_placeholders(*parts) if len(parts) == 4 else None
 
-# --- 3. THE CORE AUTOMATION TASK (MODIFIED TO RETURN A RESULT) ---
+# --- 3. THE CORE AUTOMATION TASK (WITH THE CORRECTED URL) ---
 def run_automation_task(target_url, target_bin, target_email):
-    """This function runs the automation and returns the Stripe JSON response."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -74,8 +72,9 @@ def run_automation_task(target_url, target_bin, target_email):
                 if CONFIG["RUN_LOCAL"]:
                     browser = await p.chromium.launch(headless=False, slow_mo=50)
                 else:
-                    # <<< THIS LINE IS UPDATED from the original code
-                    browserless_url = f"wss://chrome.browserless.io?token={CONFIG['BROWSERLESS_API_KEY']}&stealth"
+                    # --- THIS IS THE UPDATED LINE ---
+                    browserless_url = f"wss://production-sfo.browserless.io?token={CONFIG['BROWSERLESS_API_KEY']}"
+                    # ---------------------------------
                     browser = await p.chromium.connect_over_cdp(browserless_url, timeout=120000)
                 print("[SUCCESS] Browser connected.")
             except Exception as e:
@@ -124,37 +123,30 @@ def run_automation_task(target_url, target_bin, target_email):
     
     return loop.run_until_complete(perform_automation())
 
-# --- 4. FLASK API DEFINITION (SYNCHRONOUS GET REQUEST) ---
+# --- 4. FLASK API DEFINITION (Unchanged) ---
 app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "hrkXstripe API is running.", 200
 
 @app.route('/hrkXstripe', methods=['GET'])
 def get_stripe_response_endpoint():
-    # Get parameters from URL query string
     target_url = request.args.get('url')
     target_cc = request.args.get('cc')
-    target_email = request.args.get('email') # Optional
+    target_email = request.args.get('email')
     
     print(f"\n{'='*50}\nAPI CALL (GET): url='{target_url}', cc='{target_cc}', email='{target_email}'")
 
     if not target_url or not target_cc:
         return jsonify({"error": "Missing required query parameters. 'url' and 'cc' are mandatory."}), 400
 
-    # This call BLOCKS until the automation is done.
     result = run_automation_task(target_url, target_cc, target_email)
     
-    # Print the raw response to the console
     print("\n--- STRIPE RAW RESPONSE ---")
     print(json.dumps(result, indent=2))
     print("---------------------------\n")
     
     if result and 'error' not in result:
-        return jsonify(result), 200 # Success, return Stripe's JSON
+        return jsonify(result), 200
     elif result:
-        return jsonify(result), 500 # Automation error
+        return jsonify(result), 500
     else:
         return jsonify({"error": "An unknown error occurred."}), 500
 
