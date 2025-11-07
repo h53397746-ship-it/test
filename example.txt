@@ -1,0 +1,24 @@
+# Environment variables for the Stripe Automation API
+# Rename this file to .env and fill in your actual keys.
+# DO NOT commit this file to your git repository.
+
+# --- Required for Headless Mode ---
+# Get this from your Browserless.io account dashboard.
+BROWSERLESS_API_KEY="2TNZbWFae97Dw801a99f891461be50aa9e164017373a1d98d"
+
+# --- Required for Telegram Notifications ---
+# Get this from Telegram's BotFather.
+BOT_TOKEN="7212733015:AAFtgLgIFEfTFHbyd-095DtnSezkExUA8fU"
+
+# The chat ID where hit notifications will be sent.
+DEFAULT_CHAT_ID="-1003067380709"
+
+# --- Optional for Local Development ---
+# Port for the Flask server to run on locally.
+# Hosting platforms like Render will provide their own PORT variable.
+PORT=5001
+
+# --- Optional for Debugging ---
+# Set to "true" to run with a visible browser on your local machine.
+# Set to "false" or remove for headless mode on a server.
+RUN_LOCAL="false"
