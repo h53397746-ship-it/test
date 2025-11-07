@@ -393,7 +393,8 @@ async def run_stripe_automation(url, cc_string, email=None):
         browser = None
         context = None
         page = None
-        cdp = None  # FIX: Initialize cdp here
+        cdp = None
+        use_browserless = not CONFIG["RUN_LOCAL"]
         
         try:
             # Connect to browser
@@ -414,13 +415,18 @@ async def run_stripe_automation(url, cc_string, email=None):
                 browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}"
                 try:
                     browser = await p.chromium.connect(browser_url, timeout=30000)
-                    print("[BROWSER] Connected to Browserless")
+                    print("[BROWSER] ✓ Connected to Browserless")
                 except Exception as e:
-                    if "429" in str(e):
-                        print("[ERROR] Rate limit hit, using local browser...")
-                        browser = await p.chromium.launch(headless=True)
-                    else:
-                        raise e
+                    print(f"[BROWSER] ✗ Browserless connection failed: {e}")
+                    print("[BROWSER] Falling back to local browser...")
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=[
+                            '--disable-blink-features=AutomationControlled',
+                            '--disable-web-security'
+                        ]
+                    )
+                    use_browserless = False
             
             # Create context
             context = await browser.new_context(
@@ -431,28 +437,23 @@ async def run_stripe_automation(url, cc_string, email=None):
             )
             
             page = await context.new_page()
+            print("[BROWSER] ✓ Page created")
             
-            # Try to enable CDP session (optional, won't crash if fails)
-            try:
-                cdp = await page.context.new_cdp_session(page)
-                await cdp.send('Network.enable')
-                await cdp.send('Fetch.enable', {
-                    'patterns': [
-                        {'urlPattern': '*stripe.com*'},
-                        {'urlPattern': '*stripe.network*'}
-                    ]
-                })
-                print("[CDP] Network monitoring enabled")
-            except Exception as e:
-                print(f"[CDP] Warning: Could not enable CDP: {e}")
-                print("[CDP] Continuing without CDP monitoring...")
-                cdp = None  # Ensure it stays None if failed
+            # Only use CDP for local browser, NOT for Browserless (causes conflicts)
+            if CONFIG["RUN_LOCAL"] and not use_browserless:
+                try:
+                    cdp = await page.context.new_cdp_session(page)
+                    await cdp.send('Network.enable')
+                    print("[CDP] ✓ Network monitoring enabled (local only)")
+                except Exception as e:
+                    print(f"[CDP] Warning: {e}")
+                    cdp = None
+            else:
+                print("[CDP] Skipped (using Browserless - relies on page events only)")
             
-            # Enhanced response capture
+            # Enhanced response capture (works with or without CDP)
             async def capture_response(response):
                 try:
-                    url_lower = response.url.lower()
-                    
                     # Log ALL network activity
                     if CONFIG["DETAILED_LOGGING"]:
                         stripe_result["all_requests"].append({
@@ -526,11 +527,29 @@ async def run_stripe_automation(url, cc_string, email=None):
             # Attach event handlers
             page.on("response", capture_response)
             page.on("request", capture_request)
+            print("[EVENTS] ✓ Request/Response listeners attached")
             
-            # Navigate to page
+            # Navigate to page with retry logic
             print(f"\n[NAVIGATION] Loading: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            print("[NAVIGATION] Page loaded")
+            max_navigation_retries = 3
+            navigation_success = False
+            
+            for attempt in range(max_navigation_retries):
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    navigation_success = True
+                    print("[NAVIGATION] ✓ Page loaded successfully")
+                    break
+                except Exception as e:
+                    print(f"[NAVIGATION] Attempt {attempt + 1}/{max_navigation_retries} failed: {e}")
+                    if attempt < max_navigation_retries - 1:
+                        print("[NAVIGATION] Retrying in 2 seconds...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise Exception(f"Failed to navigate after {max_navigation_retries} attempts: {e}")
+            
+            if not navigation_success:
+                raise Exception("Navigation failed")
             
             # Wait for initial load
             await page.wait_for_timeout(3000)
@@ -791,13 +810,15 @@ async def run_stripe_automation(url, cc_string, email=None):
             start_time = time.time()
             retry_count = 0
             max_wait = CONFIG["RESPONSE_TIMEOUT_SECONDS"]
+            last_log_time = 0
             
             while time.time() - start_time < max_wait:
                 elapsed = time.time() - start_time
                 
                 # Status update every 5 seconds
-                if int(elapsed) % 5 == 0 and int(elapsed) > 0:
+                if int(elapsed) - last_log_time >= 5:
                     print(f"[MONITORING] {int(elapsed)}s elapsed, captured {len(stripe_result['raw_responses'])} responses")
+                    last_log_time = int(elapsed)
                 
                 # Check for payment confirmation
                 if stripe_result.get("payment_confirmed"):
@@ -842,16 +863,19 @@ async def run_stripe_automation(url, cc_string, email=None):
                     break
                 
                 # Check URL for success
-                current_url = page.url
-                if stripe_result.get("success_url") and current_url.startswith(stripe_result["success_url"]):
-                    print(f"[✓ SUCCESS] Redirected to success URL: {current_url}")
-                    stripe_result["payment_confirmed"] = True
-                    stripe_result["success"] = True
-                    break
-                
-                if any(x in current_url.lower() for x in ['success', 'thank', 'confirm', 'complete']):
-                    print(f"[INFO] Success page detected: {current_url}")
-                    stripe_result["success_page"] = True
+                try:
+                    current_url = page.url
+                    if stripe_result.get("success_url") and current_url.startswith(stripe_result["success_url"]):
+                        print(f"[✓ SUCCESS] Redirected to success URL: {current_url}")
+                        stripe_result["payment_confirmed"] = True
+                        stripe_result["success"] = True
+                        break
+                    
+                    if any(x in current_url.lower() for x in ['success', 'thank', 'confirm', 'complete']):
+                        print(f"[INFO] Success page detected: {current_url}")
+                        stripe_result["success_page"] = True
+                except:
+                    pass
                 
                 await asyncio.sleep(0.5)
             
@@ -1012,13 +1036,14 @@ def status_endpoint():
     """Health check and status endpoint"""
     return jsonify({
         "status": "online",
-        "version": "2.1-enhanced",
+        "version": "2.2-fixed",
         "features": {
             "detailed_logging": CONFIG["DETAILED_LOGGING"],
-            "cdp_monitoring": "optional",
+            "cdp_monitoring": "local only (disabled for Browserless)",
             "hcaptcha_support": True,
             "auto_retry": True,
-            "network_capture": True
+            "network_capture": True,
+            "browserless_compatible": True
         },
         "rate_limit": {
             "requests_made": len(request_timestamps),
@@ -1031,8 +1056,8 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
     print(f"[SERVER] Starting Enhanced Stripe Automation Server")
-    print(f"[VERSION] 2.1 with detailed logging and CDP error handling")
+    print(f"[VERSION] 2.2 - Browserless Compatible")
     print(f"[PORT] {port}")
-    print(f"[FEATURES] Optional CDP monitoring, detailed request/response logging")
+    print(f"[FEATURES] No CDP for Browserless, page event capture only")
     print("="*80)
     app.run(host='0.0.0.0', port=port, debug=True)
