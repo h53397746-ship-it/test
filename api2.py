@@ -183,12 +183,11 @@ class StripeResponseAnalyzer:
         })
         
         if StripeResponseAnalyzer.is_payment_critical_endpoint(url):
-            print(f"[PAYMENT API] {url[:60]}... [{status}]")
-            print(f"[DATA] {json.dumps(data)[:300]}...")
+            print(f"[API] {url[:60]}... [{status}]")
         
         if data.get('success_url'):
             result_dict["success_url"] = data['success_url']
-            print(f"[SUCCESS URL] {data['success_url']}")
+            print(f"[SUCCESS URL] Found")
         
         is_payment_success = (
             data.get('status') in ['succeeded', 'success', 'requires_capture', 'processing', 'complete'] or
@@ -209,24 +208,24 @@ class StripeResponseAnalyzer:
                 data.get('payment_intent', {}).get('id') or
                 data.get('payment_intent')
             )
-            print(f"[✓✓✓ PAYMENT CONFIRMED] {data.get('status')}")
+            print(f"[✓ PAYMENT CONFIRMED] {data.get('status')}")
             return
         
         if status == 200 and data.get('id', '').startswith('tok_'):
             result_dict["token_created"] = True
             result_dict["token_id"] = data.get('id')
-            print(f"[TOKEN] {data.get('id')}")
+            print(f"[TOKEN] Created")
         
         if status == 200 and data.get('id', '').startswith('pm_'):
             result_dict["payment_method_created"] = True
             result_dict["payment_method_id"] = data.get('id')
-            print(f"[PAYMENT METHOD] {data.get('id')}")
+            print(f"[PM] Created")
         
         if status == 200 and data.get('id', '').startswith('pi_'):
             result_dict["payment_intent_created"] = True
             result_dict["payment_intent_id"] = data.get('id')
             result_dict["client_secret"] = data.get('client_secret')
-            print(f"[PAYMENT INTENT] {data.get('id')} - Status: {data.get('status')}")
+            print(f"[PI] {data.get('status')}")
         
         error = data.get('error') or data.get('payment_intent', {}).get('last_payment_error')
         if error:
@@ -235,7 +234,7 @@ class StripeResponseAnalyzer:
             result_dict["error"] = error_message
             result_dict["decline_code"] = decline_code
             result_dict["success"] = False
-            print(f"[ERROR] {decline_code}: {error_message}")
+            print(f"[ERROR] {decline_code}")
         
         if data.get('status') == 'requires_action' or data.get('next_action'):
             result_dict["requires_3ds"] = True
@@ -268,7 +267,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
     
     print(f"\n{'='*80}")
     print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
-    print(f"[CARD] {card['number']} | {card['month']}/{card['year']} | {card['cvv']}")
+    print(f"[CARD] {card['number']} | {card['month']}/{card['year']}")
     print(f"[EMAIL] {email}")
     if proxy_config:
         print(f"[PROXY] {proxy_config['server']}")
@@ -294,27 +293,37 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
         payment_submitted = False
         
         try:
+            # Browser connection - NO FALLBACK in production
             if CONFIG["RUN_LOCAL"]:
+                print("[BROWSER] Local mode")
                 browser = await p.chromium.launch(
                     headless=False,
                     slow_mo=100,
                     args=['--disable-blink-features=AutomationControlled']
                 )
-                print("[BROWSER] Local mode")
             else:
                 print("[BROWSER] Connecting to Browserless...")
+                
+                if not CONFIG["BROWSERLESS_API_KEY"]:
+                    return {"error": "BROWSERLESS_API_KEY not configured"}
+                
                 browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
                 
                 if proxy_config:
                     browser_url += f"&--proxy-server={quote(proxy_config['server'])}"
-                    print(f"[PROXY] Configured: {proxy_config['server']}")
                 
                 try:
                     browser = await p.chromium.connect(browser_url, timeout=30000)
                     print("[BROWSER] ✓ Connected")
                 except Exception as e:
-                    print(f"[BROWSER] Browserless failed: {e}")
-                    browser = await p.chromium.launch(headless=True)
+                    # NO FALLBACK - just fail gracefully
+                    error_msg = str(e)
+                    if "429" in error_msg:
+                        return {"error": "Browserless rate limit exceeded. Please try again later."}
+                    elif "401" in error_msg or "403" in error_msg:
+                        return {"error": "Invalid Browserless API key"}
+                    else:
+                        return {"error": f"Failed to connect to Browserless: {error_msg}"}
             
             context_options = {
                 'viewport': {'width': 1920, 'height': 1080},
@@ -328,14 +337,16 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
             page = await context.new_page()
             print("[PAGE] ✓ Created")
             
+            # Test proxy if configured
             if proxy_config:
                 try:
                     test_response = await page.goto('https://api.ipify.org?format=json', timeout=10000)
                     ip_data = await test_response.json()
                     print(f"[PROXY] IP: {ip_data.get('ip')}")
-                except Exception as e:
-                    print(f"[PROXY] Warning: {e}")
+                except:
+                    pass
             
+            # Response capture
             async def capture_response(response):
                 try:
                     if not analyzer.is_stripe_endpoint(response.url):
@@ -354,7 +365,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
             
             page.on("response", capture_response)
             
-            print("[NAV] Loading target...")
+            print("[NAV] Loading...")
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=40000)
                 print("[NAV] ✓ Loaded")
@@ -365,6 +376,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
             
             await safe_wait(page, 3000)
             
+            # Fill email
             print("[FILL] Email...")
             email_filled = False
             try:
@@ -375,7 +387,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                             await element.click()
                             await element.fill(email)
                             email_filled = True
-                            print(f"[EMAIL] ✓ {email}")
+                            print(f"[EMAIL] ✓")
                             break
                     if email_filled:
                         break
@@ -384,13 +396,14 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
             
             await safe_wait(page, 1000)
             
-            print("[FILL] Card fields...")
+            # Fill card
+            print("[FILL] Card...")
             filled_status = {"card": False, "expiry": False, "cvc": False}
             
             try:
                 frames = page.frames
                 stripe_frames = [f for f in frames if 'stripe' in f.url.lower()]
-                print(f"[FRAMES] Found {len(stripe_frames)} Stripe frames")
+                print(f"[FRAMES] {len(stripe_frames)} Stripe frames")
                 
                 for frame in stripe_frames:
                     try:
@@ -403,7 +416,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                                         for digit in card['number']:
                                             await inp.type(digit, delay=random.randint(50, 100))
                                         filled_status["card"] = True
-                                        print(f"[CARD] ✓ {card['number']}")
+                                        print(f"[CARD] ✓")
                                         break
                                 except:
                                     continue
@@ -418,7 +431,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                                         for char in exp_string:
                                             await inp.type(char, delay=random.randint(50, 100))
                                         filled_status["expiry"] = True
-                                        print(f"[EXPIRY] ✓ {card['month']}/{card['year'][-2:]}")
+                                        print(f"[EXPIRY] ✓")
                                         break
                                 except:
                                     continue
@@ -432,7 +445,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                                         for digit in card['cvv']:
                                             await inp.type(digit, delay=random.randint(50, 100))
                                         filled_status["cvc"] = True
-                                        print(f"[CVC] ✓ {card['cvv']}")
+                                        print(f"[CVC] ✓")
                                         break
                                 except:
                                     continue
@@ -441,11 +454,12 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
             except TargetClosedError:
                 return {"error": "Browser closed during form fill"}
             
-            print(f"[STATUS] {filled_status}")
+            print(f"[STATUS] Card:{filled_status['card']} Exp:{filled_status['expiry']} CVC:{filled_status['cvc']}")
             
             await safe_wait(page, 3000)
             
-            print("[SUBMIT] Attempting...")
+            # Submit
+            print("[SUBMIT]...")
             try:
                 for selector in ['button[type="submit"]:visible', 'button.SubmitButton:visible']:
                     try:
@@ -453,7 +467,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                         if await btn.count() > 0:
                             await btn.click()
                             payment_submitted = True
-                            print("[SUBMIT] ✓ Clicked")
+                            print("[SUBMIT] ✓")
                             break
                     except:
                         continue
@@ -461,36 +475,34 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                 if not payment_submitted:
                     await page.keyboard.press('Enter')
                     payment_submitted = True
-                    print("[SUBMIT] ✓ Enter pressed")
+                    print("[SUBMIT] ✓ (Enter)")
             except:
-                print("[SUBMIT] Failed")
+                pass
             
-            print("[WAIT] Processing payment (10s)...")
+            print("[WAIT] Processing (10s)...")
             await safe_wait(page, 10000)
             
-            print("[MONITORING] Waiting for confirmation...")
+            print("[MONITOR] Waiting for response...")
             start_time = time.time()
             max_wait = CONFIG["RESPONSE_TIMEOUT_SECONDS"]
-            last_response_count = 0
+            last_count = 0
             
             while time.time() - start_time < max_wait:
-                elapsed = time.time() - start_time
-                
-                current_responses = len(stripe_result['raw_responses'])
-                if current_responses > last_response_count:
-                    print(f"[MONITOR] {current_responses} responses captured")
-                    last_response_count = current_responses
+                current_count = len(stripe_result['raw_responses'])
+                if current_count > last_count:
+                    print(f"[MONITOR] {current_count} responses")
+                    last_count = current_count
                 
                 if stripe_result.get("payment_confirmed"):
-                    print("[✓✓✓ SUCCESS] Payment confirmed!")
+                    print("[✓ SUCCESS]")
                     break
                 
                 if stripe_result.get("error"):
-                    print(f"[ERROR] {stripe_result['error']}")
+                    print(f"[ERROR] {stripe_result.get('decline_code')}")
                     break
                 
                 if stripe_result.get("requires_3ds"):
-                    print("[3DS] Authentication required")
+                    print("[3DS]")
                     break
                 
                 try:
@@ -498,30 +510,24 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                     success_url = stripe_result.get("success_url")
                     
                     if success_url and current_url.startswith(success_url):
-                        print(f"[✓ SUCCESS] Redirected to: {current_url[:80]}")
                         stripe_result["payment_confirmed"] = True
                         stripe_result["success"] = True
+                        print("[✓ REDIRECT]")
                         break
                     
                     if any(x in current_url.lower() for x in ['success', 'thank-you', 'complete', 'confirmed']):
-                        print(f"[SUCCESS PAGE] {current_url[:80]}")
                         stripe_result["payment_confirmed"] = True
                         stripe_result["success"] = True
+                        print("[✓ SUCCESS PAGE]")
                         break
                 except:
                     pass
                 
-                if int(elapsed) % 5 == 0 and int(elapsed) > 0:
-                    try:
-                        await page.evaluate('1')
-                    except:
-                        print("[WARNING] Browser disconnected")
-                        break
-                
                 await asyncio.sleep(0.5)
             
-            print(f"\n[SUMMARY] {len(stripe_result['raw_responses'])} Stripe responses captured")
+            print(f"[DONE] {len(stripe_result['raw_responses'])} responses")
             
+            # Build response
             if stripe_result.get("payment_confirmed"):
                 return {
                     "success": True,
@@ -552,26 +558,24 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
             else:
                 return {
                     "success": False,
-                    "message": "Payment not confirmed - timeout or no response",
+                    "message": "Payment not confirmed",
                     "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
                     "details": {
                         "email_filled": email_filled,
                         "card_filled": filled_status,
                         "payment_submitted": payment_submitted,
-                        "responses_captured": len(stripe_result["raw_responses"])
+                        "responses": len(stripe_result["raw_responses"])
                     },
                     "raw_responses": stripe_result["raw_responses"]
                 }
                 
         except TargetClosedError:
             return {
-                "error": "Browserless session closed (timeout or limit)",
+                "error": "Browserless session closed",
                 "raw_responses": stripe_result.get("raw_responses", [])
             }
         except Exception as e:
             print(f"[EXCEPTION] {str(e)}")
-            import traceback
-            traceback.print_exc()
             return {
                 "error": f"Automation failed: {str(e)}",
                 "raw_responses": stripe_result.get("raw_responses", [])
@@ -593,7 +597,20 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                     await browser.close()
                 except:
                     pass
-            print("[CLEANUP] ✓ Done")
+            print("[CLEANUP] ✓")
+
+@app.route('/')
+def home():
+    return jsonify({
+        "service": "Stripe Automation API",
+        "version": "2.6",
+        "status": "online",
+        "endpoints": {
+            "/hrkXstripe": "Main automation endpoint",
+            "/status": "Status check",
+            "/test": "Test endpoint"
+        }
+    })
 
 @app.route('/hrkXstripe', methods=['GET'])
 def stripe_endpoint():
@@ -611,10 +628,10 @@ def stripe_endpoint():
     
     print(f"\n{'='*80}")
     print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[URL] {url[:100]}..." if url else "[URL] None")
+    print(f"[URL] {url[:80] if url else 'None'}...")
     print(f"[CC] {cc}")
     if proxy:
-        print(f"[PROXY] {proxy}")
+        print(f"[PROXY] Configured")
     print('='*80)
     
     if not url or not cc:
@@ -625,12 +642,10 @@ def stripe_endpoint():
     
     try:
         result = loop.run_until_complete(run_stripe_automation(url, cc, email, proxy))
-        print(f"[RESULT] {'✓ SUCCESS' if result.get('success') else '✗ FAILED'}")
+        print(f"[RESULT] {'✓' if result.get('success') else '✗'}")
         return jsonify(result), 200 if result.get('success') else 400
     except Exception as e:
         print(f"[SERVER ERROR] {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
     finally:
         loop.close()
@@ -639,45 +654,45 @@ def stripe_endpoint():
 def status_endpoint():
     return jsonify({
         "status": "online",
-        "version": "2.5-complete",
-        "features": {
-            "proxy_support": True,
-            "browserless": True,
-            "payment_confirmation": True,
-            "detailed_logging": True
-        },
+        "version": "2.6-production",
+        "mode": "Browserless" if not CONFIG['RUN_LOCAL'] else "Local",
+        "browserless_configured": bool(CONFIG.get("BROWSERLESS_API_KEY")),
         "proxy_configured": bool(CONFIG.get("PROXY_SERVER")),
         "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/test', methods=['GET'])
 def test_endpoint():
-    """Test endpoint to verify server is working"""
     return jsonify({
         "status": "working",
-        "message": "Server is running correctly",
-        "endpoints": {
-            "/hrkXstripe": "Main automation endpoint (GET)",
-            "/status": "Status check",
-            "/test": "This endpoint"
+        "message": "API is operational",
+        "config": {
+            "mode": "Browserless" if not CONFIG['RUN_LOCAL'] else "Local",
+            "browserless": bool(CONFIG.get("BROWSERLESS_API_KEY")),
+            "proxy": bool(CONFIG.get("PROXY_SERVER"))
         },
-        "example": "/hrkXstripe?url=https://checkout.stripe.com/...&cc=4111111111111111|12|2025|123&email=test@example.com&proxy=http://proxy:8080"
+        "example": "/hrkXstripe?url=https://checkout.stripe.com/...&cc=4111111111111111|12|2025|123"
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
-    print("[SERVER] Stripe Automation v2.5 - Complete Edition")
+    print("[SERVER] Stripe Automation v2.6 - Production Ready")
     print(f"[PORT] {port}")
-    print(f"[MODE] {'Local Browser' if CONFIG['RUN_LOCAL'] else 'Browserless'}")
+    print(f"[MODE] {'Local Browser' if CONFIG['RUN_LOCAL'] else 'Browserless Only'}")
+    
+    if not CONFIG['RUN_LOCAL'] and not CONFIG.get('BROWSERLESS_API_KEY'):
+        print("[WARNING] BROWSERLESS_API_KEY not set!")
+    
     if CONFIG.get("PROXY_SERVER"):
-        print(f"[PROXY] {CONFIG['PROXY_SERVER']}")
+        print(f"[PROXY] Configured")
+    
     print("\n[FEATURES]")
-    print("  ✓ Browserless support")
-    print("  ✓ Proxy support (HTTP/HTTPS/SOCKS5)")
-    print("  ✓ Payment confirmation detection")
-    print("  ✓ Detailed API logging")
+    print("  ✓ Browserless support (no fallback)")
+    print("  ✓ Proxy support")
+    print("  ✓ Payment confirmation")
+    print("  ✓ Detailed logging")
     print("  ✓ Rate limiting")
-    print("  ✓ Error handling")
     print("="*80)
+    
     app.run(host='0.0.0.0', port=port, debug=False)
