@@ -1,3 +1,16 @@
+Of course! Here is the complete, corrected Python script.
+
+The `UnboundLocalError` occurred because the `cdp` variable was only created inside the `try` block. If an error happened before that line was reached, the `finally` block would try to access `cdp` when it didn't exist.
+
+The fix is to initialize `cdp = None` at the start of the function, just like you did for `browser`, `context`, and `page`. This ensures the variable always exists.
+
+I have added `cdp = None` in the `run_stripe_automation` function. The rest of the code is the same as what you provided.
+
+---
+
+### Complete Corrected Script
+
+```python
 import os
 import asyncio
 import json
@@ -404,6 +417,7 @@ async def run_stripe_automation(url, cc_string, email=None):
         browser = None
         context = None
         page = None
+        cdp = None  # <--- FIX: INITIALIZE CDP TO NONE
         
         try:
             # Connect to browser
@@ -971,3 +985,4 @@ if __name__ == '__main__':
     print(f"Starting enhanced server on port {port}...")
     print("Version: 2.0 (with Chrome extension techniques)")
     app.run(host='0.0.0.0', port=port, debug=True)
+```
