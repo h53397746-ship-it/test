@@ -19,13 +19,13 @@ CONFIG = {
     "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
     "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
     "RESPONSE_TIMEOUT_SECONDS": 60,
-    "RETRY_DELAY": 2000,  # Match JS extension
+    "RETRY_DELAY": 2000,
     "RATE_LIMIT_REQUESTS": 5,
     "RATE_LIMIT_WINDOW": 60,
     "MAX_RETRIES": 3,
     "RETRY_BACKOFF": 5,
     "DEBUGGER_VERSION": "1.3",
-    "DETAILED_LOGGING": True  # Enable detailed request/response logging
+    "DETAILED_LOGGING": True
 }
 
 app = Flask(__name__)
@@ -147,7 +147,7 @@ def generate_random_name():
                   'Anderson', 'Taylor', 'Thomas', 'Moore', 'Jackson', 'Martin', 'Lee', 'Thompson', 'White', 'Harris']
     return f"{random.choice(first_names)} {random.choice(last_names)}"
 
-# === ENHANCED RESPONSE ANALYZER WITH DETAILED LOGGING ===
+# === RESPONSE ANALYZER WITH DETAILED LOGGING ===
 class StripeResponseAnalyzer:
     """Analyzes Stripe API responses with detailed logging"""
     
@@ -158,28 +158,10 @@ class StripeResponseAnalyzer:
         return any(domain in url.lower() for domain in stripe_domains)
     
     @staticmethod
-    def log_request_details(method, url, headers, body):
-        """Log detailed request information"""
-        print("\n" + "="*80)
-        print(f"[REQUEST LOG] {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
-        print(f"[METHOD] {method}")
-        print(f"[URL] {url}")
-        
-        if CONFIG["DETAILED_LOGGING"]:
-            if headers:
-                print("[HEADERS]")
-                for key, value in headers.items():
-                    if 'authorization' not in key.lower():
-                        print(f"  {key}: {value[:100]}...")
-            
-            if body:
-                print(f"[BODY] {body[:500]}...")
-        print("="*80)
-    
-    @staticmethod
     def analyze_response(url, status, body_text, result_dict):
         """
         Analyze response with detailed logging
+        Modifies result_dict in place
         """
         print("\n" + "="*80)
         print(f"[RESPONSE LOG] {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
@@ -192,10 +174,11 @@ class StripeResponseAnalyzer:
             
             if CONFIG["DETAILED_LOGGING"]:
                 print("[RAW RESPONSE]")
-                print(json.dumps(data, indent=2)[:2000])  # Limit output length
+                print(json.dumps(data, indent=2)[:2000])
                 
         except json.JSONDecodeError:
             print(f"[RAW TEXT] {body_text[:500]}")
+            print("="*80)
             return
         
         print("="*80)
@@ -209,7 +192,7 @@ class StripeResponseAnalyzer:
             "raw_text": body_text if CONFIG["DETAILED_LOGGING"] else None
         })
         
-        # Analysis logic
+        # Check for success_url
         if data.get('success_url'):
             result_dict["success_url"] = data['success_url']
             print(f"[SUCCESS URL FOUND] {data['success_url']}")
@@ -267,17 +250,20 @@ class StripeResponseAnalyzer:
 
 # === ENHANCED HCAPTCHA HANDLER ===
 async def handle_hcaptcha_advanced(page):
-    """Advanced hCaptcha handling with better detection"""
+    """Advanced hCaptcha handling"""
     print("\n[HCAPTCHA] Checking for hCaptcha presence...")
     
     # Check if hCaptcha exists on page
-    hcaptcha_exists = await page.evaluate('''
-        () => {
-            return document.querySelector('iframe[src*="hcaptcha.com"]') !== null ||
-                   document.querySelector('[data-hcaptcha-widget-id]') !== null ||
-                   document.querySelector('.h-captcha') !== null;
-        }
-    ''')
+    try:
+        hcaptcha_exists = await page.evaluate('''
+            () => {
+                return document.querySelector('iframe[src*="hcaptcha.com"]') !== null ||
+                       document.querySelector('[data-hcaptcha-widget-id]') !== null ||
+                       document.querySelector('.h-captcha') !== null;
+            }
+        ''')
+    except:
+        return True
     
     if not hcaptcha_exists:
         print("[HCAPTCHA] No hCaptcha found on page")
@@ -313,7 +299,6 @@ async def handle_hcaptcha_advanced(page):
     
     if widget_frame:
         try:
-            # Check if already solved
             check_div = await widget_frame.query_selector('div.check')
             if check_div:
                 display = await check_div.get_attribute('style')
@@ -321,14 +306,12 @@ async def handle_hcaptcha_advanced(page):
                     print("[HCAPTCHA] Already solved!")
                     return True
             
-            # Click checkbox
             checkbox = await widget_frame.query_selector('#checkbox')
             if checkbox:
                 await simulate_click(widget_frame, checkbox)
                 print("[HCAPTCHA] Clicked checkbox")
                 await asyncio.sleep(3)
                 
-                # Check if auto-solved
                 check_div = await widget_frame.query_selector('div.check')
                 if check_div:
                     display = await check_div.get_attribute('style')
@@ -338,10 +321,8 @@ async def handle_hcaptcha_advanced(page):
         except Exception as e:
             print(f"[HCAPTCHA] Widget error: {e}")
     
-    # Wait for challenge if needed
     await asyncio.sleep(2)
     
-    # Look for challenge frame
     challenge_frame = None
     for frame in page.frames:
         if 'hcaptcha.com' in frame.url and 'challenge' in frame.url:
@@ -353,7 +334,6 @@ async def handle_hcaptcha_advanced(page):
         try:
             await asyncio.sleep(2)
             
-            # Submit without selecting images (often works)
             submit_button = await challenge_frame.query_selector('.button-submit')
             if submit_button:
                 await simulate_click(challenge_frame, submit_button)
@@ -366,7 +346,7 @@ async def handle_hcaptcha_advanced(page):
     
     return False
 
-# === MAIN AUTOMATION FUNCTION WITH ENHANCED LOGGING ===
+# === MAIN AUTOMATION FUNCTION ===
 async def run_stripe_automation(url, cc_string, email=None):
     card = process_card_input(cc_string)
     if not card:
@@ -375,7 +355,6 @@ async def run_stripe_automation(url, cc_string, email=None):
     if not email:
         email = f"test{random.randint(1000,9999)}@example.com"
     
-    # Generate random billing details
     random_name = generate_random_name()
     billing_details = {
         "name": random_name,
@@ -404,18 +383,17 @@ async def run_stripe_automation(url, cc_string, email=None):
         "payment_intent_created": False,
         "success_url": None,
         "requires_3ds": False,
-        "all_requests": []  # Store all network requests
+        "all_requests": []
     }
     
-    # Response analyzer
     analyzer = StripeResponseAnalyzer()
     
     async with async_playwright() as p:
-        # Initialize all variables before try block
+        # Initialize ALL variables before try block
         browser = None
         context = None
         page = None
-        cdp = None  # Fix: Initialize cdp here
+        cdp = None  # FIX: Initialize cdp here
         
         try:
             # Connect to browser
@@ -454,7 +432,7 @@ async def run_stripe_automation(url, cc_string, email=None):
             
             page = await context.new_page()
             
-            # Enable CDP session for detailed network monitoring
+            # Try to enable CDP session (optional, won't crash if fails)
             try:
                 cdp = await page.context.new_cdp_session(page)
                 await cdp.send('Network.enable')
@@ -467,7 +445,8 @@ async def run_stripe_automation(url, cc_string, email=None):
                 print("[CDP] Network monitoring enabled")
             except Exception as e:
                 print(f"[CDP] Warning: Could not enable CDP: {e}")
-                cdp = None
+                print("[CDP] Continuing without CDP monitoring...")
+                cdp = None  # Ensure it stays None if failed
             
             # Enhanced response capture
             async def capture_response(response):
@@ -497,11 +476,9 @@ async def run_stripe_automation(url, cc_string, email=None):
                             body = await response.body()
                             text = body.decode('utf-8', errors='ignore')
                             
-                            # Log raw response
                             if CONFIG["DETAILED_LOGGING"]:
                                 print(f"[RAW BODY LENGTH] {len(text)} bytes")
                             
-                            # Analyze response
                             analyzer.analyze_response(
                                 response.url,
                                 response.status,
@@ -538,11 +515,9 @@ async def run_stripe_automation(url, cc_string, email=None):
                             if post_data:
                                 print(f"[POST DATA PREVIEW] {post_data[:200]}...")
                                 
-                                # Check for card data
                                 if 'card[number]' in post_data or 'card%5Bnumber%5D' in post_data:
                                     print("[DETECTED] Card submission in request")
                                 
-                                # Check for payment confirmation
                                 if 'payment_method' in post_data:
                                     print("[DETECTED] Payment method in request")
                     except Exception as e:
@@ -652,7 +627,6 @@ async def run_stripe_automation(url, cc_string, email=None):
             
             print(f"[STRIPE] Found {len(stripe_frames)} Stripe frames")
             
-            # Log frame URLs for debugging
             if CONFIG["DETAILED_LOGGING"]:
                 for frame in stripe_frames:
                     print(f"  Frame URL: {frame.url[:100]}")
@@ -764,7 +738,6 @@ async def run_stripe_automation(url, cc_string, email=None):
             print("\n[SUBMIT] Attempting payment submission...")
             submit_attempted = False
             
-            # Submit selectors
             submit_selectors = [
                 'button.SubmitButton:visible',
                 'button[type="submit"]:visible',
@@ -786,7 +759,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                 except:
                     continue
             
-            # JavaScript submit if needed
             if not submit_attempted:
                 try:
                     await page.evaluate('''
@@ -804,7 +776,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                 except:
                     pass
             
-            # Enter key as last resort
             if not submit_attempted:
                 await page.keyboard.press('Enter')
                 submit_attempted = True
@@ -825,7 +796,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                 elapsed = time.time() - start_time
                 
                 # Status update every 5 seconds
-                if int(elapsed) % 5 == 0:
+                if int(elapsed) % 5 == 0 and int(elapsed) > 0:
                     print(f"[MONITORING] {int(elapsed)}s elapsed, captured {len(stripe_result['raw_responses'])} responses")
                 
                 # Check for payment confirmation
@@ -847,11 +818,9 @@ async def run_stripe_automation(url, cc_string, email=None):
                         
                         await asyncio.sleep(CONFIG["RETRY_DELAY"] / 1000)
                         
-                        # Re-handle hCaptcha
                         await handle_hcaptcha_advanced(page)
                         await asyncio.sleep(1)
                         
-                        # Resubmit
                         for selector in submit_selectors[:3]:
                             try:
                                 btn = page.locator(selector).first
@@ -880,7 +849,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                     stripe_result["success"] = True
                     break
                 
-                # Check for success indicators
                 if any(x in current_url.lower() for x in ['success', 'thank', 'confirm', 'complete']):
                     print(f"[INFO] Success page detected: {current_url}")
                     stripe_result["success_page"] = True
@@ -944,7 +912,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                         "total_network_requests": len(stripe_result["all_requests"])
                     },
                     "raw_responses": stripe_result["raw_responses"],
-                    "all_requests": stripe_result["all_requests"][:20]  # First 20 requests
+                    "all_requests": stripe_result["all_requests"][:20]
                 }
                 
         except Exception as e:
@@ -959,7 +927,7 @@ async def run_stripe_automation(url, cc_string, email=None):
             }
             
         finally:
-            # Clean up (cdp is now guaranteed to be defined)
+            # Clean up - cdp is guaranteed to be defined
             if cdp:
                 try:
                     await cdp.detach()
@@ -1019,7 +987,7 @@ def stripe_endpoint():
         
         print("\n" + "="*80)
         print("[FINAL RESULT]")
-        print(json.dumps(result, indent=2)[:1000])  # Limit output
+        print(json.dumps(result, indent=2)[:1000])
         print("="*80 + "\n")
         
         if result.get('success'):
@@ -1047,7 +1015,7 @@ def status_endpoint():
         "version": "2.1-enhanced",
         "features": {
             "detailed_logging": CONFIG["DETAILED_LOGGING"],
-            "cdp_monitoring": True,
+            "cdp_monitoring": "optional",
             "hcaptcha_support": True,
             "auto_retry": True,
             "network_capture": True
@@ -1063,8 +1031,8 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
     print(f"[SERVER] Starting Enhanced Stripe Automation Server")
-    print(f"[VERSION] 2.1 with detailed logging")
+    print(f"[VERSION] 2.1 with detailed logging and CDP error handling")
     print(f"[PORT] {port}")
-    print(f"[FEATURES] CDP monitoring, detailed request/response logging")
+    print(f"[FEATURES] Optional CDP monitoring, detailed request/response logging")
     print("="*80)
     app.run(host='0.0.0.0', port=port, debug=True)
