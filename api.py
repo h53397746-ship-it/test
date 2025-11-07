@@ -73,12 +73,12 @@ def random_digit():
 
 def generate_card_from_pattern(pattern):
     """Generate card from pattern with x placeholders"""
-    clean_pattern = pattern.replace(/[^0-9x]/gi, '')
+    clean_pattern = re.sub(r'[^0-9x]', '', pattern, flags=re.IGNORECASE)
     card_length = get_card_length(clean_pattern.replace('x', '0'))
     
     result = ''
     for char in clean_pattern:
-        if result.length >= card_length - 1:
+        if len(result) >= card_length - 1:
             break
         if char.lower() == 'x':
             result += random_digit()
