@@ -74,7 +74,8 @@ def run_automation_task(target_url, target_bin, target_email):
                 if CONFIG["RUN_LOCAL"]:
                     browser = await p.chromium.launch(headless=False, slow_mo=50)
                 else:
-                    browserless_url = f"wss://chrome.browserless.io?token={CONFIG['BROWSERLESS_API_KEY']}"
+                    # <<< THIS LINE IS UPDATED from the original code
+                    browserless_url = f"wss://chrome.browserless.io?token={CONFIG['BROWSERLESS_API_KEY']}&stealth"
                     browser = await p.chromium.connect_over_cdp(browserless_url, timeout=120000)
                 print("[SUCCESS] Browser connected.")
             except Exception as e:
