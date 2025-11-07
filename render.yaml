@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: hrkx-stripe-api
+    env: python
+    plan: starter # Choose a plan (Starter is free)
+    buildCommand: |
+      pip install -r requirements.txt
+      playwright install chromium
+    startCommand: gunicorn api:app --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.6
+      - key: BROWSERLESS_API_KEY
+        sync: false # Set this securely in the Render dashboard
+      - key: BOT_TOKEN
+        sync: false # Set this securely in the Render dashboard
+      - key: DEFAULT_CHAT_ID
+        sync: false # Set this securely in the Render dashboard
