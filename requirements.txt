@@ -2,3 +2,4 @@ Flask
 gunicorn
 playwright
 requests
+python-dotenv
