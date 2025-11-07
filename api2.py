@@ -17,19 +17,25 @@ load_dotenv()
 CONFIG = {
     "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
     "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
-    "PROXY_SERVER": os.getenv('PROXY_SERVER'),
-    "PROXY_USERNAME": os.getenv('PROXY_USERNAME'),
-    "PROXY_PASSWORD": os.getenv('PROXY_PASSWORD'),
     "RESPONSE_TIMEOUT_SECONDS": 50,
     "RETRY_DELAY": 2000,
     "RATE_LIMIT_REQUESTS": 5,
     "RATE_LIMIT_WINDOW": 60,
     "MAX_RETRIES": 2,
-    "BROWSERLESS_TIMEOUT": 60000
+    "BROWSERLESS_TIMEOUT": 60000,
+    "IP_ROTATION_STRATEGY": os.getenv('IP_ROTATION_STRATEGY', 'session'),  # session, region, stealth
+    "BROWSERLESS_REGIONS": ['production-sfo', 'production-lon', 'production-syd']  # Multiple regions
 }
 
 app = Flask(__name__)
 request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
+
+# IP rotation tracking
+ip_rotation_state = {
+    "last_region_index": 0,
+    "session_count": 0,
+    "last_ip": None
+}
 
 def rate_limit_check():
     now = time.time()
@@ -44,34 +50,64 @@ def rate_limit_check():
     request_timestamps.append(now)
     return True, 0
 
-def parse_proxy(proxy_string, username=None, password=None):
-    """Parse proxy string and return Playwright-compatible proxy config"""
-    if not proxy_string:
-        return None
+def get_browserless_endpoint():
+    """
+    Get Browserless endpoint with IP rotation strategy
+    Returns: (endpoint_url, region_name)
+    """
+    strategy = CONFIG["IP_ROTATION_STRATEGY"]
     
-    proxy_config = {}
+    if strategy == 'region':
+        # Rotate through different Browserless regions for different IPs
+        regions = CONFIG["BROWSERLESS_REGIONS"]
+        current_index = ip_rotation_state["last_region_index"]
+        region = regions[current_index % len(regions)]
+        ip_rotation_state["last_region_index"] = (current_index + 1) % len(regions)
+        
+        endpoint = f"wss://{region}.browserless.io/chromium/playwright"
+        print(f"[IP ROTATION] Using region: {region}")
+        return endpoint, region
     
-    if '@' in proxy_string:
-        if '://' in proxy_string:
-            protocol, rest = proxy_string.split('://', 1)
-            creds, server = rest.split('@', 1)
-            username, password = creds.split(':', 1)
-            proxy_string = f"{protocol}://{server}"
-        else:
-            creds, server = proxy_string.split('@', 1)
-            username, password = creds.split(':', 1)
-            proxy_string = server
+    elif strategy == 'stealth':
+        # Use stealth mode with default region
+        endpoint = "wss://production-sfo.browserless.io/chromium/playwright"
+        print(f"[IP ROTATION] Using stealth mode")
+        return endpoint, "production-sfo-stealth"
     
-    if '://' not in proxy_string:
-        proxy_string = f'http://{proxy_string}'
+    else:  # session (default)
+        # Each new session may get a different IP from Browserless pool
+        ip_rotation_state["session_count"] += 1
+        endpoint = "wss://production-sfo.browserless.io/chromium/playwright"
+        print(f"[IP ROTATION] New session #{ip_rotation_state['session_count']}")
+        return endpoint, f"session-{ip_rotation_state['session_count']}"
+
+def build_browserless_url(api_key, strategy='session'):
+    """
+    Build Browserless connection URL with IP rotation features
+    """
+    endpoint, region = get_browserless_endpoint()
     
-    proxy_config['server'] = proxy_string
+    # Base URL with API key and timeout
+    url = f"{endpoint}?token={api_key}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
     
-    if username and password:
-        proxy_config['username'] = username
-        proxy_config['password'] = password
+    # Add stealth mode parameters
+    if strategy == 'stealth' or CONFIG["IP_ROTATION_STRATEGY"] == 'stealth':
+        url += "&stealth=true"
+        url += "&--disable-blink-features=AutomationControlled"
     
-    return proxy_config
+    # Add additional parameters for better anonymity
+    url += "&--disable-dev-shm-usage"
+    url += "&--no-sandbox"
+    
+    # Randomize user agent
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    ]
+    
+    return url, region, random.choice(user_agents)
 
 def luhn_algorithm(number_str):
     total = 0
@@ -247,7 +283,26 @@ async def safe_wait(page, ms):
     except:
         return False
 
-async def run_stripe_automation(url, cc_string, email=None, proxy=None):
+async def check_ip_address(page):
+    """Check current IP address"""
+    try:
+        response = await page.goto('https://api.ipify.org?format=json', timeout=10000)
+        ip_data = await response.json()
+        current_ip = ip_data.get('ip')
+        
+        # Track IP changes
+        if ip_rotation_state["last_ip"] and ip_rotation_state["last_ip"] != current_ip:
+            print(f"[IP CHANGE] {ip_rotation_state['last_ip']} → {current_ip}")
+        else:
+            print(f"[IP] {current_ip}")
+        
+        ip_rotation_state["last_ip"] = current_ip
+        return current_ip
+    except Exception as e:
+        print(f"[IP] Could not check: {e}")
+        return None
+
+async def run_stripe_automation(url, cc_string, email=None):
     card = process_card_input(cc_string)
     if not card:
         return {"error": "Invalid card format. Use: number|month|year|cvv"}
@@ -255,22 +310,11 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
     email = email or f"test{random.randint(1000,9999)}@example.com"
     random_name = generate_random_name()
     
-    proxy_config = None
-    if proxy:
-        proxy_config = parse_proxy(proxy)
-    elif CONFIG["PROXY_SERVER"]:
-        proxy_config = parse_proxy(
-            CONFIG["PROXY_SERVER"],
-            CONFIG.get("PROXY_USERNAME"),
-            CONFIG.get("PROXY_PASSWORD")
-        )
-    
     print(f"\n{'='*80}")
     print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
     print(f"[CARD] {card['number']} | {card['month']}/{card['year']}")
     print(f"[EMAIL] {email}")
-    if proxy_config:
-        print(f"[PROXY] {proxy_config['server']}")
+    print(f"[IP STRATEGY] {CONFIG['IP_ROTATION_STRATEGY']}")
     print('='*80)
     
     stripe_result = {
@@ -281,7 +325,9 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
         "payment_method_created": False,
         "payment_intent_created": False,
         "success_url": None,
-        "requires_3ds": False
+        "requires_3ds": False,
+        "ip_address": None,
+        "region": None
     }
     
     analyzer = StripeResponseAnalyzer()
@@ -293,7 +339,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
         payment_submitted = False
         
         try:
-            # Browser connection - NO FALLBACK in production
+            # Browser connection with IP rotation
             if CONFIG["RUN_LOCAL"]:
                 print("[BROWSER] Local mode")
                 browser = await p.chromium.launch(
@@ -301,50 +347,56 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                     slow_mo=100,
                     args=['--disable-blink-features=AutomationControlled']
                 )
+                user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+                region = "local"
             else:
                 print("[BROWSER] Connecting to Browserless...")
                 
                 if not CONFIG["BROWSERLESS_API_KEY"]:
                     return {"error": "BROWSERLESS_API_KEY not configured"}
                 
-                browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
-                
-                if proxy_config:
-                    browser_url += f"&--proxy-server={quote(proxy_config['server'])}"
+                # Get Browserless URL with IP rotation
+                browser_url, region, user_agent = build_browserless_url(
+                    CONFIG["BROWSERLESS_API_KEY"],
+                    CONFIG["IP_ROTATION_STRATEGY"]
+                )
                 
                 try:
                     browser = await p.chromium.connect(browser_url, timeout=30000)
-                    print("[BROWSER] ✓ Connected")
+                    print(f"[BROWSER] ✓ Connected to {region}")
+                    stripe_result["region"] = region
                 except Exception as e:
-                    # NO FALLBACK - just fail gracefully
                     error_msg = str(e)
                     if "429" in error_msg:
-                        return {"error": "Browserless rate limit exceeded. Please try again later."}
+                        return {"error": "Browserless rate limit exceeded"}
                     elif "401" in error_msg or "403" in error_msg:
                         return {"error": "Invalid Browserless API key"}
                     else:
                         return {"error": f"Failed to connect to Browserless: {error_msg}"}
             
+            # Create context with randomized settings for better anonymity
             context_options = {
-                'viewport': {'width': 1920, 'height': 1080},
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+                'viewport': {
+                    'width': random.choice([1920, 1366, 1440, 1536]),
+                    'height': random.choice([1080, 768, 900, 864])
+                },
+                'user_agent': user_agent,
+                'locale': random.choice(['en-US', 'en-GB', 'en-CA']),
+                'timezone_id': random.choice([
+                    'America/New_York',
+                    'America/Los_Angeles',
+                    'America/Chicago',
+                    'Europe/London'
+                ])
             }
-            
-            if proxy_config and CONFIG["RUN_LOCAL"]:
-                context_options['proxy'] = proxy_config
             
             context = await browser.new_context(**context_options)
             page = await context.new_page()
             print("[PAGE] ✓ Created")
             
-            # Test proxy if configured
-            if proxy_config:
-                try:
-                    test_response = await page.goto('https://api.ipify.org?format=json', timeout=10000)
-                    ip_data = await test_response.json()
-                    print(f"[PROXY] IP: {ip_data.get('ip')}")
-                except:
-                    pass
+            # Check IP address
+            current_ip = await check_ip_address(page)
+            stripe_result["ip_address"] = current_ip
             
             # Response capture
             async def capture_response(response):
@@ -365,6 +417,7 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
             
             page.on("response", capture_response)
             
+            # Navigate to target
             print("[NAV] Loading...")
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=40000)
@@ -536,7 +589,8 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
                     "payment_intent_id": stripe_result.get("payment_intent_id"),
                     "token_id": stripe_result.get("token_id"),
                     "payment_method_id": stripe_result.get("payment_method_id"),
-                    "proxy_used": proxy_config['server'] if proxy_config else None,
+                    "ip_address": stripe_result.get("ip_address"),
+                    "region": stripe_result.get("region"),
                     "raw_responses": stripe_result["raw_responses"]
                 }
             elif stripe_result.get("requires_3ds"):
@@ -603,12 +657,14 @@ async def run_stripe_automation(url, cc_string, email=None, proxy=None):
 def home():
     return jsonify({
         "service": "Stripe Automation API",
-        "version": "2.6",
+        "version": "3.0",
+        "provider": "Browserless",
+        "ip_rotation": CONFIG["IP_ROTATION_STRATEGY"],
         "status": "online",
         "endpoints": {
             "/hrkXstripe": "Main automation endpoint",
             "/status": "Status check",
-            "/test": "Test endpoint"
+            "/ip-stats": "IP rotation statistics"
         }
     })
 
@@ -624,14 +680,11 @@ def stripe_endpoint():
     url = request.args.get('url')
     cc = request.args.get('cc')
     email = request.args.get('email')
-    proxy = request.args.get('proxy')
     
     print(f"\n{'='*80}")
     print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"[URL] {url[:80] if url else 'None'}...")
     print(f"[CC] {cc}")
-    if proxy:
-        print(f"[PROXY] Configured")
     print('='*80)
     
     if not url or not cc:
@@ -641,7 +694,7 @@ def stripe_endpoint():
     asyncio.set_event_loop(loop)
     
     try:
-        result = loop.run_until_complete(run_stripe_automation(url, cc, email, proxy))
+        result = loop.run_until_complete(run_stripe_automation(url, cc, email))
         print(f"[RESULT] {'✓' if result.get('success') else '✗'}")
         return jsonify(result), 200 if result.get('success') else 400
     except Exception as e:
@@ -654,11 +707,23 @@ def stripe_endpoint():
 def status_endpoint():
     return jsonify({
         "status": "online",
-        "version": "2.6-production",
-        "mode": "Browserless" if not CONFIG['RUN_LOCAL'] else "Local",
+        "version": "3.0-ip-rotation",
+        "provider": "Browserless",
+        "ip_rotation_strategy": CONFIG["IP_ROTATION_STRATEGY"],
+        "available_regions": CONFIG["BROWSERLESS_REGIONS"],
         "browserless_configured": bool(CONFIG.get("BROWSERLESS_API_KEY")),
-        "proxy_configured": bool(CONFIG.get("PROXY_SERVER")),
         "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/ip-stats', methods=['GET'])
+def ip_stats_endpoint():
+    """Get IP rotation statistics"""
+    return jsonify({
+        "strategy": CONFIG["IP_ROTATION_STRATEGY"],
+        "total_sessions": ip_rotation_state["session_count"],
+        "current_region_index": ip_rotation_state["last_region_index"],
+        "last_ip": ip_rotation_state["last_ip"],
+        "available_regions": CONFIG["BROWSERLESS_REGIONS"]
     })
 
 @app.route('/test', methods=['GET'])
@@ -666,10 +731,10 @@ def test_endpoint():
     return jsonify({
         "status": "working",
         "message": "API is operational",
-        "config": {
-            "mode": "Browserless" if not CONFIG['RUN_LOCAL'] else "Local",
-            "browserless": bool(CONFIG.get("BROWSERLESS_API_KEY")),
-            "proxy": bool(CONFIG.get("PROXY_SERVER"))
+        "provider": "Browserless",
+        "ip_rotation": {
+            "strategy": CONFIG["IP_ROTATION_STRATEGY"],
+            "regions": CONFIG["BROWSERLESS_REGIONS"]
         },
         "example": "/hrkXstripe?url=https://checkout.stripe.com/...&cc=4111111111111111|12|2025|123"
     })
@@ -677,22 +742,23 @@ def test_endpoint():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
-    print("[SERVER] Stripe Automation v2.6 - Production Ready")
+    print("[SERVER] Stripe Automation v3.0 - IP Rotation Edition")
     print(f"[PORT] {port}")
-    print(f"[MODE] {'Local Browser' if CONFIG['RUN_LOCAL'] else 'Browserless Only'}")
+    print(f"[PROVIDER] Browserless")
+    print(f"[IP ROTATION] {CONFIG['IP_ROTATION_STRATEGY']}")
+    
+    if CONFIG["IP_ROTATION_STRATEGY"] == 'region':
+        print(f"[REGIONS] {', '.join(CONFIG['BROWSERLESS_REGIONS'])}")
     
     if not CONFIG['RUN_LOCAL'] and not CONFIG.get('BROWSERLESS_API_KEY'):
         print("[WARNING] BROWSERLESS_API_KEY not set!")
     
-    if CONFIG.get("PROXY_SERVER"):
-        print(f"[PROXY] Configured")
-    
     print("\n[FEATURES]")
-    print("  ✓ Browserless support (no fallback)")
-    print("  ✓ Proxy support")
-    print("  ✓ Payment confirmation")
+    print("  ✓ IP Rotation (session/region/stealth)")
+    print("  ✓ Multiple datacenter regions")
+    print("  ✓ Randomized browser fingerprints")
+    print("  ✓ Payment confirmation detection")
     print("  ✓ Detailed logging")
-    print("  ✓ Rate limiting")
     print("="*80)
     
     app.run(host='0.0.0.0', port=port, debug=False)
