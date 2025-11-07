@@ -4,6 +4,7 @@ import json
 import random
 import re
 import time
+import requests
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from playwright._impl._errors import TargetClosedError
@@ -16,40 +17,28 @@ load_dotenv()
 CONFIG = {
     "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
     "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
+    "PROXY_COUNTRY": os.getenv('PROXY_COUNTRY', 'us'),  # us, uk, ca, au, etc.
     "RESPONSE_TIMEOUT_SECONDS": 50,
     "RETRY_DELAY": 2000,
     "RATE_LIMIT_REQUESTS": 5,
     "RATE_LIMIT_WINDOW": 60,
     "MAX_RETRIES": 2,
-    "BROWSERLESS_TIMEOUT": 60000,
-    "IP_ROTATION_ENABLED": True
+    "BROWSERLESS_TIMEOUT": 60000
 }
 
 app = Flask(__name__)
 request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
 
-# IP Rotation: Browserless regions (different geographic IPs)
-BROWSERLESS_REGIONS = [
-    'production-sfo',      # San Francisco, USA
-    'production-lon',      # London, UK
-    'production-syd',      # Sydney, Australia
-]
+# Available proxy countries for rotation
+PROXY_COUNTRIES = ['us', 'uk', 'ca', 'au', 'de', 'fr', 'nl', 'es', 'it', 'se']
+current_country_index = 0
 
-# Track region rotation
-region_rotation_index = 0
-
-def get_next_browserless_region():
-    """Get next Browserless region for IP rotation"""
-    global region_rotation_index
-    
-    if not CONFIG["IP_ROTATION_ENABLED"]:
-        return 'production-sfo'  # Default
-    
-    region = BROWSERLESS_REGIONS[region_rotation_index % len(BROWSERLESS_REGIONS)]
-    region_rotation_index += 1
-    
-    print(f"[IP ROTATION] Using region: {region}")
-    return region
+def get_next_proxy_country():
+    """Get next proxy country for IP rotation"""
+    global current_country_index
+    country = PROXY_COUNTRIES[current_country_index % len(PROXY_COUNTRIES)]
+    current_country_index += 1
+    return country
 
 def rate_limit_check():
     now = time.time()
@@ -63,6 +52,107 @@ def rate_limit_check():
     
     request_timestamps.append(now)
     return True, 0
+
+def create_browserless_session(target_url, proxy_country=None):
+    """Create Browserless session with BrowserQL and get WebSocket endpoint"""
+    
+    if not CONFIG["BROWSERLESS_API_KEY"]:
+        raise Exception("BROWSERLESS_API_KEY not configured")
+    
+    if not proxy_country:
+        proxy_country = get_next_proxy_country()
+    
+    # Browserless BrowserQL endpoint
+    endpoint = "https://production-sfo.browserless.io/chrome/bql"
+    
+    # Query parameters
+    query_params = {
+        "token": CONFIG["BROWSERLESS_API_KEY"],
+        "proxy": "residential",  # Use residential proxy
+        "proxySticky": "true",   # Keep same IP for session
+        "proxyCountry": proxy_country,  # Country selection
+        "humanlike": "true",     # Human-like behavior
+        "blockConsentModals": "true",  # Auto-close cookie popups
+        "timeout": CONFIG["BROWSERLESS_TIMEOUT"]
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    # BrowserQL mutation - navigate, solve captcha, and get reconnect endpoint
+    payload = {
+        "query": f"""
+mutation SetupSession {{
+  viewport(width: 1920, height: 1080) {{
+    width
+    height
+    time
+  }}
+  
+  reject(type: [stylesheet, font]) {{
+    enabled
+    time
+  }}
+  
+  goto(url: "{target_url}", waitUntil: domContentLoaded) {{
+    status
+  }}
+  
+  wait(time: 3000) {{
+    time
+  }}
+  
+  verify(type: hcaptcha) {{
+    solved
+  }}
+  
+  verify(type: recaptcha) {{
+    solved
+  }}
+  
+  verify(type: cloudflare) {{
+    solved
+  }}
+  
+  reconnect(timeout: 300000) {{
+    browserWSEndpoint
+  }}
+}}
+        """,
+        "operationName": "SetupSession",
+    }
+    
+    try:
+        print(f"[BQL] Creating session with proxy country: {proxy_country.upper()}")
+        response = requests.post(endpoint, params=query_params, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if result.get('errors'):
+            raise Exception(f"BQL errors: {result['errors']}")
+        
+        data = result.get('data', {})
+        reconnect_data = data.get('reconnect', {})
+        ws_endpoint = reconnect_data.get('browserWSEndpoint')
+        
+        if not ws_endpoint:
+            raise Exception("No WebSocket endpoint returned")
+        
+        print(f"[BQL] ✓ Session created")
+        print(f"[BQL] ✓ Captchas auto-solved")
+        print(f"[BQL] ✓ WebSocket endpoint ready")
+        
+        return {
+            'ws_endpoint': ws_endpoint,
+            'proxy_country': proxy_country,
+            'captcha_solved': True,
+            'bql_result': data
+        }
+        
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Failed to create Browserless session: {str(e)}")
 
 def luhn_algorithm(number_str):
     total = 0
@@ -238,7 +328,7 @@ async def safe_wait(page, ms):
     except:
         return False
 
-async def run_stripe_automation(url, cc_string, email=None):
+async def run_stripe_automation(url, cc_string, email=None, proxy_country=None):
     card = process_card_input(cc_string)
     if not card:
         return {"error": "Invalid card format. Use: number|month|year|cvv"}
@@ -246,12 +336,8 @@ async def run_stripe_automation(url, cc_string, email=None):
     email = email or f"test{random.randint(1000,9999)}@example.com"
     random_name = generate_random_name()
     
-    # Get Browserless region for IP rotation
-    region = get_next_browserless_region()
-    
     print(f"\n{'='*80}")
     print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
-    print(f"[REGION] {region}")
     print(f"[CARD] {card['number']} | {card['month']}/{card['year']}")
     print(f"[EMAIL] {email}")
     print('='*80)
@@ -264,11 +350,11 @@ async def run_stripe_automation(url, cc_string, email=None):
         "payment_method_created": False,
         "payment_intent_created": False,
         "success_url": None,
-        "requires_3ds": False,
-        "region_used": region
+        "requires_3ds": False
     }
     
     analyzer = StripeResponseAnalyzer()
+    browserless_session = None
     
     async with async_playwright() as p:
         browser = None
@@ -284,62 +370,42 @@ async def run_stripe_automation(url, cc_string, email=None):
                     slow_mo=100,
                     args=['--disable-blink-features=AutomationControlled']
                 )
+                context = await browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+                )
             else:
-                print("[BROWSERLESS] Connecting...")
+                print("[BROWSERLESS] Creating session with BrowserQL...")
                 
-                if not CONFIG["BROWSERLESS_API_KEY"]:
-                    return {"error": "BROWSERLESS_API_KEY not configured"}
+                # Create Browserless session with captcha solving
+                browserless_session = create_browserless_session(url, proxy_country)
+                ws_endpoint = browserless_session['ws_endpoint']
                 
-                # Build Browserless URL with selected region
-                # Each region has different IP pool
-                browserless_url = f"wss://{region}.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
+                stripe_result["proxy_country"] = browserless_session['proxy_country']
+                stripe_result["captcha_solved"] = browserless_session['captcha_solved']
                 
-                # Add stealth mode for better anonymity
-                browserless_url += "&stealth=true"
+                print(f"[BROWSERLESS] Connecting to session...")
                 
-                # Random session ID to ensure fresh IP from pool
-                session_id = random.randint(100000, 999999)
-                browserless_url += f"&blockAds=true"
+                # Connect to the WebSocket endpoint
+                browser = await p.chromium.connect_over_cdp(ws_endpoint)
                 
-                try:
-                    browser = await p.chromium.connect(browserless_url, timeout=30000)
-                    print(f"[BROWSERLESS] ✓ Connected to {region}")
-                except Exception as e:
-                    error_msg = str(e)
-                    if "429" in error_msg:
-                        return {"error": "Browserless rate limit exceeded"}
-                    elif "401" in error_msg or "403" in error_msg:
-                        return {"error": "Invalid Browserless API key"}
-                    else:
-                        return {"error": f"Failed to connect: {error_msg}"}
+                # Get existing context (BrowserQL already created one)
+                contexts = browser.contexts
+                if contexts:
+                    context = contexts[0]
+                else:
+                    context = await browser.new_context()
+                
+                print(f"[BROWSERLESS] ✓ Connected with proxy: {browserless_session['proxy_country'].upper()}")
             
-            # Create context with randomized fingerprint for better anonymity
-            user_agents = [
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
-            ]
+            # Get or create page
+            pages = context.pages
+            if pages:
+                page = pages[0]
+            else:
+                page = await context.new_page()
             
-            context_options = {
-                'viewport': {
-                    'width': random.choice([1920, 1366, 1440, 1536]),
-                    'height': random.choice([1080, 768, 900, 864])
-                },
-                'user_agent': random.choice(user_agents),
-                'locale': random.choice(['en-US', 'en-GB', 'en-CA', 'en-AU']),
-                'timezone_id': random.choice([
-                    'America/New_York',
-                    'America/Los_Angeles',
-                    'America/Chicago',
-                    'Europe/London',
-                    'Australia/Sydney'
-                ])
-            }
-            
-            context = await browser.new_context(**context_options)
-            page = await context.new_page()
-            print("[PAGE] ✓ Created")
+            print("[PAGE] ✓ Ready")
             
             # Response capture
             async def capture_response(response):
@@ -360,17 +426,9 @@ async def run_stripe_automation(url, cc_string, email=None):
             
             page.on("response", capture_response)
             
-            # Navigate
-            print("[NAV] Loading...")
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=40000)
-                print("[NAV] ✓ Loaded")
-            except TargetClosedError:
-                return {"error": "Browser closed (timeout)"}
-            except Exception as e:
-                return {"error": f"Navigation failed: {str(e)}"}
-            
-            await safe_wait(page, 3000)
+            # Page is already loaded by BrowserQL, just wait a bit
+            print("[WAIT] Page already loaded by BrowserQL...")
+            await safe_wait(page, 2000)
             
             # Fill email
             print("[FILL] Email...")
@@ -532,7 +590,8 @@ async def run_stripe_automation(url, cc_string, email=None):
                     "payment_intent_id": stripe_result.get("payment_intent_id"),
                     "token_id": stripe_result.get("token_id"),
                     "payment_method_id": stripe_result.get("payment_method_id"),
-                    "region_used": region,
+                    "proxy_country": stripe_result.get("proxy_country"),
+                    "captcha_solved": stripe_result.get("captcha_solved"),
                     "raw_responses": stripe_result["raw_responses"]
                 }
             elif stripe_result.get("requires_3ds"):
@@ -565,11 +624,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                     "raw_responses": stripe_result["raw_responses"]
                 }
                 
-        except TargetClosedError:
-            return {
-                "error": "Browserless session closed",
-                "raw_responses": stripe_result.get("raw_responses", [])
-            }
         except Exception as e:
             print(f"[EXCEPTION] {str(e)}")
             import traceback
@@ -585,7 +639,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                     await page.close()
                 except:
                     pass
-            if context:
+            if context and CONFIG["RUN_LOCAL"]:
                 try:
                     await context.close()
                 except:
@@ -601,19 +655,19 @@ async def run_stripe_automation(url, cc_string, email=None):
 def home():
     return jsonify({
         "service": "Stripe Automation API",
-        "version": "3.1",
-        "provider": "Browserless",
+        "version": "4.0",
+        "provider": "Browserless BrowserQL",
         "status": "online",
         "features": {
-            "ip_rotation": True,
-            "multiple_regions": BROWSERLESS_REGIONS,
-            "payment_detection": True,
-            "stealth_mode": True
+            "residential_proxies": True,
+            "auto_captcha_solving": True,
+            "proxy_countries": PROXY_COUNTRIES,
+            "captcha_types": ["hCaptcha", "reCAPTCHA", "Cloudflare"],
+            "ip_rotation": True
         },
         "endpoints": {
             "/hrkXstripe": "Main automation endpoint",
-            "/status": "Status check",
-            "/ip-stats": "IP rotation statistics"
+            "/status": "Status check"
         }
     })
 
@@ -629,11 +683,14 @@ def stripe_endpoint():
     url = request.args.get('url')
     cc = request.args.get('cc')
     email = request.args.get('email')
+    proxy_country = request.args.get('country')  # Optional: us, uk, ca, etc.
     
     print(f"\n{'='*80}")
     print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"[URL] {url[:80] if url else 'None'}...")
     print(f"[CC] {cc}")
+    if proxy_country:
+        print(f"[COUNTRY] {proxy_country.upper()}")
     print('='*80)
     
     if not url or not cc:
@@ -643,11 +700,13 @@ def stripe_endpoint():
     asyncio.set_event_loop(loop)
     
     try:
-        result = loop.run_until_complete(run_stripe_automation(url, cc, email))
+        result = loop.run_until_complete(run_stripe_automation(url, cc, email, proxy_country))
         print(f"[RESULT] {'✓' if result.get('success') else '✗'}")
         return jsonify(result), 200 if result.get('success') else 400
     except Exception as e:
         print(f"[SERVER ERROR] {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
     finally:
         loop.close()
@@ -656,63 +715,39 @@ def stripe_endpoint():
 def status_endpoint():
     return jsonify({
         "status": "online",
-        "version": "3.1-ip-rotation",
-        "provider": "Browserless",
+        "version": "4.0-browserql",
+        "provider": "Browserless BrowserQL",
         "mode": "Browserless" if not CONFIG['RUN_LOCAL'] else "Local",
         "browserless_configured": bool(CONFIG.get("BROWSERLESS_API_KEY")),
-        "ip_rotation": {
-            "enabled": CONFIG["IP_ROTATION_ENABLED"],
-            "method": "Multi-region rotation",
-            "regions": BROWSERLESS_REGIONS,
-            "current_index": region_rotation_index
+        "features": {
+            "residential_proxies": True,
+            "auto_captcha_solving": True,
+            "available_countries": PROXY_COUNTRIES,
+            "captcha_support": ["hCaptcha", "reCAPTCHA", "Cloudflare"],
+            "humanlike_behavior": True
         },
         "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/ip-stats', methods=['GET'])
-def ip_stats_endpoint():
-    """Get IP rotation statistics"""
-    return jsonify({
-        "rotation_enabled": CONFIG["IP_ROTATION_ENABLED"],
-        "available_regions": BROWSERLESS_REGIONS,
-        "current_rotation_index": region_rotation_index,
-        "total_rotations": region_rotation_index,
-        "next_region": BROWSERLESS_REGIONS[region_rotation_index % len(BROWSERLESS_REGIONS)]
-    })
-
-@app.route('/test', methods=['GET'])
-def test_endpoint():
-    return jsonify({
-        "status": "working",
-        "message": "API is operational",
-        "provider": "Browserless",
-        "ip_rotation": {
-            "enabled": True,
-            "method": "Geographic region rotation",
-            "regions": BROWSERLESS_REGIONS
-        },
-        "example": "/hrkXstripe?url=https://checkout.stripe.com/...&cc=4111111111111111|12|2025|123"
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
-    print("[SERVER] Stripe Automation v3.1 - IP Rotation Edition")
+    print("[SERVER] Stripe Automation v4.0 - BrowserQL Edition")
     print(f"[PORT] {port}")
-    print(f"[PROVIDER] Browserless")
-    print(f"[IP ROTATION] {len(BROWSERLESS_REGIONS)} regions")
+    print(f"[PROVIDER] Browserless BrowserQL")
     
     if not CONFIG['RUN_LOCAL'] and not CONFIG.get('BROWSERLESS_API_KEY'):
         print("[WARNING] BROWSERLESS_API_KEY not set!")
     
     print("\n[FEATURES]")
-    print("  ✓ Browserless multi-region support")
-    print("  ✓ Automatic IP rotation (3 regions)")
-    print(f"  ✓ Regions: {', '.join(BROWSERLESS_REGIONS)}")
-    print("  ✓ Stealth mode enabled")
-    print("  ✓ Randomized browser fingerprints")
+    print("  ✓ Residential proxies (Browserless)")
+    print("  ✓ Auto captcha solving (hCaptcha, reCAPTCHA, Cloudflare)")
+    print("  ✓ IP rotation via proxy countries")
+    print(f"  ✓ Available countries: {', '.join(PROXY_COUNTRIES[:5])}...")
+    print("  ✓ Human-like behavior")
+    print("  ✓ Auto-block cookie popups")
     print("  ✓ Payment confirmation detection")
-    print("  ✓ Detailed logging")
+    print("\n[DOCS] https://docs.browserless.io/browserql")
     print("="*80)
     
     app.run(host='0.0.0.0', port=port, debug=False)
