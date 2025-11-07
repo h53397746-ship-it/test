@@ -67,12 +67,9 @@ def complete_luhn(base):
 
 def get_card_length(bin_str):
     first_two = bin_str[:2] if len(bin_str) >= 2 else ""
-    first_four = bin_str[:4] if len(bin_str) >= 4 else ""
     
     if first_two in ['34', '37']:
         return 15
-    if first_two == '36' or first_two == '38':
-        return 14
     return 16
 
 def get_cvv_length(card_number):
@@ -140,109 +137,7 @@ def process_card_input(cc_string):
     number, month, year, cvv = parts
     return process_card_with_placeholders(number, month, year, cvv)
 
-# === HCAPTCHA HANDLER ===
-async def handle_hcaptcha(page):
-    """Attempt to handle hCaptcha by clicking checkbox and randomly selecting images if needed"""
-    try:
-        print("[HCAPTCHA] Looking for hCaptcha iframe...")
-        
-        # Wait a bit for hCaptcha to load
-        await page.wait_for_timeout(2000)
-        
-        # Find hCaptcha checkbox iframe
-        hcaptcha_checkbox_frame = None
-        for frame in page.frames:
-            if 'hcaptcha.com/captcha' in frame.url and 'checkbox' in frame.url:
-                hcaptcha_checkbox_frame = frame
-                print(f"[HCAPTCHA] Found checkbox frame: {frame.url[:50]}...")
-                break
-        
-        if hcaptcha_checkbox_frame:
-            # Click the checkbox
-            try:
-                checkbox = await hcaptcha_checkbox_frame.query_selector('#checkbox')
-                if checkbox:
-                    await checkbox.click()
-                    print("[HCAPTCHA] Clicked checkbox")
-                    
-                    # Wait to see if it auto-solves
-                    await page.wait_for_timeout(3000)
-                    
-                    # Check if challenge frame appeared
-                    challenge_frame = None
-                    for frame in page.frames:
-                        if 'hcaptcha.com/captcha' in frame.url and 'challenge' in frame.url:
-                            challenge_frame = frame
-                            print("[HCAPTCHA] Challenge frame appeared - attempting to solve...")
-                            break
-                    
-                    if challenge_frame:
-                        # Look for image grid
-                        await page.wait_for_timeout(1000)
-                        
-                        # Try to find and click random images
-                        try:
-                            # Get all clickable image elements
-                            images = await challenge_frame.query_selector_all('.task-image')
-                            if images:
-                                print(f"[HCAPTCHA] Found {len(images)} images in challenge")
-                                
-                                # Randomly select 3-4 images
-                                num_to_select = random.randint(3, min(4, len(images)))
-                                selected_indices = random.sample(range(len(images)), num_to_select)
-                                
-                                for idx in selected_indices:
-                                    await images[idx].click()
-                                    print(f"[HCAPTCHA] Clicked image {idx + 1}")
-                                    await page.wait_for_timeout(random.randint(500, 1000))
-                                
-                                # Look for submit/continue button
-                                submit_button = await challenge_frame.query_selector('.button-submit')
-                                if not submit_button:
-                                    submit_button = await challenge_frame.query_selector('.button')
-                                if not submit_button:
-                                    submit_button = await challenge_frame.query_selector('[role="button"]')
-                                
-                                if submit_button:
-                                    await submit_button.click()
-                                    print("[HCAPTCHA] Clicked submit button")
-                                    await page.wait_for_timeout(2000)
-                                    
-                                    # Check if we need to solve another challenge
-                                    new_images = await challenge_frame.query_selector_all('.task-image')
-                                    if new_images and len(new_images) > 0:
-                                        print("[HCAPTCHA] New challenge appeared, solving again...")
-                                        # Repeat the process once more
-                                        num_to_select = random.randint(2, min(3, len(new_images)))
-                                        selected_indices = random.sample(range(len(new_images)), num_to_select)
-                                        
-                                        for idx in selected_indices:
-                                            await new_images[idx].click()
-                                            await page.wait_for_timeout(random.randint(500, 1000))
-                                        
-                                        submit_button = await challenge_frame.query_selector('.button-submit')
-                                        if submit_button:
-                                            await submit_button.click()
-                                            print("[HCAPTCHA] Submitted second challenge")
-                                
-                        except Exception as e:
-                            print(f"[HCAPTCHA] Error solving challenge: {e}")
-                    else:
-                        print("[HCAPTCHA] No challenge - possibly auto-solved!")
-                        return True
-                        
-            except Exception as e:
-                print(f"[HCAPTCHA] Error clicking checkbox: {e}")
-        else:
-            print("[HCAPTCHA] No hCaptcha checkbox found")
-            
-        return False
-        
-    except Exception as e:
-        print(f"[HCAPTCHA] Error handling hCaptcha: {e}")
-        return False
-
-# === MAIN AUTOMATION FUNCTION ===
+# === COMPREHENSIVE AUTOMATION FUNCTION ===
 async def run_stripe_automation(url, cc_string, email=None):
     card = process_card_input(cc_string)
     if not card:
@@ -262,7 +157,8 @@ async def run_stripe_automation(url, cc_string, email=None):
         "raw_responses": [],
         "payment_confirmed": False,
         "token_created": False,
-        "hcaptcha_handled": False
+        "payment_intent_created": False,
+        "hcaptcha_passes": []
     }
     
     async with async_playwright() as p:
@@ -276,12 +172,14 @@ async def run_stripe_automation(url, cc_string, email=None):
                 print("[BROWSER] Launching local browser...")
                 browser = await p.chromium.launch(
                     headless=False,
-                    slow_mo=150,  # Slower for more human-like behavior
+                    slow_mo=150,
                     args=[
                         '--disable-blink-features=AutomationControlled',
                         '--disable-features=IsolateOrigins,site-per-process',
                         '--disable-web-security',
-                        '--window-size=1920,1080'
+                        '--window-size=1920,1080',
+                        '--disable-dev-shm-usage',
+                        '--no-sandbox'
                     ]
                 )
             else:
@@ -289,10 +187,10 @@ async def run_stripe_automation(url, cc_string, email=None):
                 browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}"
                 try:
                     browser = await p.chromium.connect(browser_url, timeout=30000)
-                    print("[BROWSER] Connected to Browserless successfully")
+                    print("[BROWSER] Connected to Browserless")
                 except Exception as e:
                     if "429" in str(e):
-                        print("[ERROR] Browserless rate limit hit. Using local browser...")
+                        print("[ERROR] Rate limit hit, using local browser...")
                         browser = await p.chromium.launch(headless=True)
                     else:
                         raise e
@@ -302,11 +200,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
                 locale='en-US',
-                timezone_id='America/New_York',
-                extra_http_headers={
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-                }
+                timezone_id='America/New_York'
             )
             
             page = await context.new_page()
@@ -316,17 +210,17 @@ async def run_stripe_automation(url, cc_string, email=None):
                 try:
                     url_lower = response.url.lower()
                     
-                    # Important endpoints to capture
+                    # Important endpoints
                     important_endpoints = [
                         '/v1/payment_intents',
                         '/v1/tokens',
                         '/v1/payment_methods',
                         '/v1/confirm',
-                        '/v1/customers',
                         '/v1/charges',
-                        '/v1/3ds2/',
-                        '/v1/elements/sessions',
-                        'hcaptcha.com'
+                        '/v1/customers',
+                        'hcaptcha.com/getcaptcha',
+                        '/v1/checkout/sessions',
+                        '/v1/three_d_secure'
                     ]
                     
                     if any(endpoint in url_lower for endpoint in important_endpoints):
@@ -339,8 +233,8 @@ async def run_stripe_automation(url, cc_string, email=None):
                             
                             try:
                                 data = json.loads(text)
-                                print(f"[RAW RESPONSE] {json.dumps(data, indent=2)[:1000]}...")
                                 
+                                # Store raw response
                                 stripe_result["raw_responses"].append({
                                     "url": response.url,
                                     "status": response.status,
@@ -348,30 +242,41 @@ async def run_stripe_automation(url, cc_string, email=None):
                                     "timestamp": datetime.now().isoformat()
                                 })
                                 
-                                # Check for payment confirmation
-                                if 'payment_intent' in url_lower or 'confirm' in url_lower:
-                                    if response.status == 200:
-                                        stripe_result["payment_confirmed"] = True
-                                        
-                                        if data.get('status') in ['succeeded', 'requires_capture']:
-                                            stripe_result["success"] = True
-                                            stripe_result["message"] = "Payment successful"
-                                        elif data.get('status') == 'requires_action':
-                                            stripe_result["requires_3ds"] = True
-                                            stripe_result["message"] = "3D Secure required"
-                                        elif data.get('error'):
-                                            stripe_result["error"] = data.get('error', {}).get('message', 'Unknown error')
-                                            stripe_result["decline_code"] = data.get('error', {}).get('decline_code')
+                                # Print relevant parts
+                                if 'error' in data:
+                                    print(f"[ERROR IN RESPONSE] {data['error']}")
+                                    stripe_result["error"] = data['error'].get('message', 'Unknown error')
+                                    stripe_result["decline_code"] = data['error'].get('decline_code')
                                 
                                 # Check for token creation
                                 if '/v1/tokens' in url_lower and response.status == 200:
                                     stripe_result["token_created"] = True
                                     stripe_result["token_id"] = data.get('id')
-                                    print(f"[TOKEN] Created: {data.get('id')}")
+                                    print(f"[TOKEN CREATED] {data.get('id')}")
+                                
+                                # Check for payment intent
+                                if 'payment_intent' in url_lower and response.status == 200:
+                                    stripe_result["payment_intent_created"] = True
+                                    if data.get('status') in ['succeeded', 'requires_capture', 'processing']:
+                                        stripe_result["payment_confirmed"] = True
+                                        stripe_result["success"] = True
+                                        stripe_result["message"] = f"Payment {data.get('status')}"
+                                        print(f"[PAYMENT CONFIRMED] Status: {data.get('status')}")
+                                
+                                # Check for checkout session
+                                if 'checkout/sessions' in url_lower and response.status == 200:
+                                    if data.get('payment_status') == 'paid':
+                                        stripe_result["payment_confirmed"] = True
+                                        stripe_result["success"] = True
+                                        print("[PAYMENT CONFIRMED] Checkout session paid")
+                                
+                                # Track hCaptcha passes
+                                if 'hcaptcha.com/getcaptcha' in url_lower and data.get('pass'):
+                                    stripe_result["hcaptcha_passes"].append(data.get('generated_pass_UUID'))
+                                    print(f"[HCAPTCHA] Pass received")
                                     
                             except json.JSONDecodeError:
-                                if len(text) < 1000:
-                                    print(f"[RAW TEXT] {text}")
+                                pass
                                     
                         except Exception as e:
                             print(f"[ERROR READING] {e}")
@@ -379,349 +284,425 @@ async def run_stripe_automation(url, cc_string, email=None):
                 except Exception as e:
                     print(f"[CAPTURE ERROR] {e}")
             
+            # Capture network requests for debugging
+            async def capture_request(request):
+                if 'stripe.com/v1' in request.url.lower():
+                    print(f"[REQUEST] {request.method} {request.url[:100]}...")
+                    if request.method == "POST":
+                        try:
+                            post_data = request.post_data
+                            if post_data:
+                                print(f"[POST DATA] {post_data[:200]}...")
+                        except:
+                            pass
+            
             page.on("response", capture_response)
+            page.on("request", capture_request)
             
             # Navigate to page
             print(f"\n[NAVIGATE] Loading: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-            # Wait for page to stabilize
+            # Wait for initial load
             await page.wait_for_timeout(3000)
             
-            # Fill email in main page first
-            print("\n[FORM] Starting to fill email...")
+            # Take initial screenshot
+            if CONFIG["RUN_LOCAL"]:
+                await page.screenshot(path="initial.png")
+                print("[SCREENSHOT] Initial page captured")
+            
+            # APPROACH 1: Fill email first
+            print("\n[APPROACH 1] Filling email...")
             email_filled = False
+            
+            # Try multiple email selectors
             email_selectors = [
                 'input[type="email"]',
                 'input[name="email"]',
-                'input[id*="email" i]',
-                'input[placeholder*="email" i]'
+                '#email',
+                'input[placeholder*="email" i]',
+                'input[id*="email" i]'
             ]
             
             for selector in email_selectors:
                 try:
-                    email_field = await page.query_selector(selector)
-                    if email_field and await email_field.is_visible():
-                        await email_field.click()
-                        await email_field.fill("")  # Clear first
-                        await email_field.type(email, delay=50)
-                        print(f"[FILLED] Email field")
-                        email_filled = True
-                        
-                        # Press Tab to trigger any validation
-                        await page.keyboard.press('Tab')
-                        await page.wait_for_timeout(1000)
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        if await element.is_visible():
+                            await element.click()
+                            await element.fill("")
+                            await element.type(email, delay=50)
+                            await page.keyboard.press('Tab')
+                            email_filled = True
+                            print(f"[FILLED] Email using {selector}")
+                            break
+                    if email_filled:
                         break
                 except:
                     continue
             
             # Wait for Stripe Elements to load
-            print("[WAITING] Waiting for Stripe Elements to load...")
             await page.wait_for_timeout(3000)
+            
+            # APPROACH 2: Fill card details in Stripe iframes
+            print("\n[APPROACH 2] Looking for Stripe iframes...")
+            
+            filled_status = {
+                "card": False,
+                "expiry": False,
+                "cvc": False,
+                "postal": False
+            }
             
             # Get all frames
             frames = page.frames
-            print(f"[FRAMES] Found {len(frames)} frames on page")
+            print(f"[FRAMES] Found {len(frames)} frames")
             
-            # Look for Stripe frames
+            # Identify Stripe frames by URL
             stripe_frames = []
             for frame in frames:
-                frame_url = frame.url
-                if 'stripe' in frame_url.lower() or 'checkout.stripe' in frame_url.lower():
+                if any(x in frame.url.lower() for x in ['stripe', 'checkout.stripe', 'js.stripe']):
                     stripe_frames.append(frame)
-                    print(f"[STRIPE FRAME] {frame_url[:80]}...")
+                    print(f"[STRIPE FRAME] {frame.url[:80]}...")
             
-            # Fill card details
-            card_filled = False
-            expiry_filled = False
-            cvc_filled = False
-            postal_filled = False
-            
-            # Try each Stripe frame
+            # Try to fill in each Stripe frame
             for frame in stripe_frames:
-                print(f"\n[FRAME] Filling card details in Stripe frame...")
-                
-                # Card number
-                if not card_filled:
-                    card_selectors = [
-                        'input[name="cardnumber"]',
-                        'input[name="cardNumber"]',
-                        'input[placeholder*="1234" i]',
-                        'input[placeholder*="Card number" i]',
-                        'input[data-elements-stable-field-name="cardNumber"]',
-                        '#Field-numberInput'
-                    ]
-                    
-                    for selector in card_selectors:
-                        try:
-                            element = await frame.query_selector(selector)
-                            if element:
-                                await element.click()
-                                await page.wait_for_timeout(100)
-                                
-                                # Type card number with human-like delays
-                                for digit in card['number']:
-                                    await element.type(digit, delay=random.randint(50, 100))
-                                
-                                print(f"[FILLED] Card number")
-                                card_filled = True
-                                await page.keyboard.press('Tab')
-                                await page.wait_for_timeout(500)
-                                break
-                        except:
-                            continue
-                
-                # Expiry
-                if not expiry_filled:
-                    expiry_selectors = [
-                        'input[name="exp-date"]',
-                        'input[name="cardExpiry"]',
-                        'input[placeholder*="MM / YY" i]',
-                        'input[placeholder*="MM/YY" i]',
-                        'input[data-elements-stable-field-name="cardExpiry"]',
-                        '#Field-expiryInput'
-                    ]
-                    
-                    for selector in expiry_selectors:
-                        try:
-                            element = await frame.query_selector(selector)
-                            if element:
-                                await element.click()
-                                await page.wait_for_timeout(100)
-                                
-                                expiry_str = f"{card['month']}/{card['year'][-2:]}"
-                                for char in expiry_str:
-                                    await element.type(char, delay=random.randint(50, 100))
-                                
-                                print(f"[FILLED] Expiry date")
-                                expiry_filled = True
-                                await page.keyboard.press('Tab')
-                                await page.wait_for_timeout(500)
-                                break
-                        except:
-                            continue
-                
-                # CVC
-                if not cvc_filled:
-                    cvc_selectors = [
-                        'input[name="cvc"]',
-                        'input[name="cardCvc"]',
-                        'input[placeholder*="CVC" i]',
-                        'input[placeholder*="CVV" i]',
-                        'input[data-elements-stable-field-name="cardCvc"]',
-                        '#Field-cvcInput'
-                    ]
-                    
-                    for selector in cvc_selectors:
-                        try:
-                            element = await frame.query_selector(selector)
-                            if element:
-                                await element.click()
-                                await page.wait_for_timeout(100)
-                                
-                                for digit in card['cvv']:
-                                    await element.type(digit, delay=random.randint(50, 100))
-                                
-                                print(f"[FILLED] CVV/CVC")
-                                cvc_filled = True
-                                await page.keyboard.press('Tab')
-                                await page.wait_for_timeout(500)
-                                break
-                        except:
-                            continue
-                
-                # Postal code
-                if not postal_filled:
-                    postal_selectors = [
-                        'input[name="postalCode"]',
-                        'input[name="postal"]',
-                        'input[placeholder*="ZIP" i]',
-                        'input[placeholder*="Postal" i]',
-                        '#Field-postalCodeInput'
-                    ]
-                    
-                    for selector in postal_selectors:
-                        try:
-                            element = await frame.query_selector(selector)
-                            if element:
-                                await element.click()
-                                await element.fill('10001')
-                                print(f"[FILLED] Postal code")
-                                postal_filled = True
-                                break
-                        except:
-                            continue
-            
-            print(f"\n[FORM STATUS] Email: {email_filled}, Card: {card_filled}, Expiry: {expiry_filled}, CVC: {cvc_filled}, Postal: {postal_filled}")
-            
-            # Wait before attempting to submit
-            await page.wait_for_timeout(2000)
-            
-            # Handle hCaptcha before submitting
-            print("\n[HCAPTCHA] Checking for hCaptcha...")
-            hcaptcha_handled = await handle_hcaptcha(page)
-            stripe_result["hcaptcha_handled"] = hcaptcha_handled
-            
-            # Wait a bit after hCaptcha handling
-            await page.wait_for_timeout(2000)
-            
-            # Try to submit the form
-            print("\n[SUBMIT] Looking for submit button...")
-            submit_selectors = [
-                'button[type="submit"]',
-                'button:has-text("Pay")',
-                'button:has-text("Subscribe")',
-                'button:has-text("Complete")',
-                'button:has-text("Confirm")',
-                '.SubmitButton',
-                'button.SubmitButton',
-                'button[data-testid="hosted-payment-submit-button"]',
-                'button.Button--primary'
-            ]
-            
-            submit_clicked = False
-            for selector in submit_selectors:
                 try:
-                    # Try in main page
-                    buttons = await page.query_selector_all(selector)
-                    for button in buttons:
-                        if await button.is_visible():
-                            # Scroll to button
-                            await button.scroll_into_view_if_needed()
-                            await page.wait_for_timeout(500)
-                            
-                            # Click the button
-                            await button.click()
-                            print(f"[CLICKED] Submit button: {selector}")
-                            submit_clicked = True
-                            break
-                    
-                    if submit_clicked:
-                        break
-                        
-                except Exception as e:
-                    continue
-            
-            if not submit_clicked:
-                # Try with force click
-                print("[RETRY] Trying force click on submit...")
-                try:
-                    submit_button = page.locator('button[type="submit"]').first
-                    await submit_button.click(force=True)
-                    submit_clicked = True
-                    print("[CLICKED] Submit via force click")
-                except:
-                    pass
-            
-            # If still not clicked, try clicking any visible button
-            if not submit_clicked:
-                print("[RETRY] Clicking any visible button...")
-                try:
-                    all_buttons = await page.query_selector_all('button')
-                    for button in all_buttons:
-                        text = await button.text_content()
-                        if text and any(word in text.lower() for word in ['pay', 'submit', 'complete', 'confirm']):
-                            await button.click()
-                            print(f"[CLICKED] Button with text: {text}")
-                            submit_clicked = True
-                            break
-                except:
-                    pass
-            
-            if submit_clicked:
-                # Wait for processing
-                print("\n[PROCESSING] Waiting for payment processing...")
-                await page.wait_for_timeout(5000)
-                
-                # Check if hCaptcha appeared after submit
-                if not hcaptcha_handled:
-                    print("[HCAPTCHA] Checking again after submit...")
-                    hcaptcha_handled = await handle_hcaptcha(page)
-                    if hcaptcha_handled:
-                        # Try to submit again after hCaptcha
-                        await page.wait_for_timeout(2000)
-                        for selector in submit_selectors:
+                    # Card number
+                    if not filled_status["card"]:
+                        card_inputs = await frame.query_selector_all('input')
+                        for inp in card_inputs:
                             try:
-                                button = page.locator(selector).first
-                                if await button.is_visible(timeout=1000):
-                                    await button.click()
-                                    print(f"[CLICKED] Submit again after hCaptcha")
+                                placeholder = await inp.get_attribute('placeholder')
+                                name = await inp.get_attribute('name')
+                                data_elements = await inp.get_attribute('data-elements-stable-field-name')
+                                
+                                if any(x for x in ['cardnumber', 'card number', '1234'] if x in (placeholder or '').lower()) or \
+                                   name in ['cardnumber', 'cardNumber'] or \
+                                   data_elements == 'cardNumber':
+                                    await inp.click()
+                                    for digit in card['number']:
+                                        await inp.type(digit, delay=random.randint(50, 100))
+                                    filled_status["card"] = True
+                                    print("[FILLED] Card number in iframe")
+                                    await page.keyboard.press('Tab')
                                     break
                             except:
                                 continue
+                    
+                    # Expiry
+                    if not filled_status["expiry"]:
+                        exp_inputs = await frame.query_selector_all('input')
+                        for inp in exp_inputs:
+                            try:
+                                placeholder = await inp.get_attribute('placeholder')
+                                name = await inp.get_attribute('name')
+                                
+                                if any(x for x in ['mm', 'expiry', 'exp'] if x in (placeholder or '').lower()) or \
+                                   name in ['exp-date', 'cardExpiry', 'cc-exp']:
+                                    await inp.click()
+                                    exp_string = f"{card['month']}/{card['year'][-2:]}"
+                                    for char in exp_string:
+                                        await inp.type(char, delay=random.randint(50, 100))
+                                    filled_status["expiry"] = True
+                                    print("[FILLED] Expiry in iframe")
+                                    await page.keyboard.press('Tab')
+                                    break
+                            except:
+                                continue
+                    
+                    # CVC
+                    if not filled_status["cvc"]:
+                        cvc_inputs = await frame.query_selector_all('input')
+                        for inp in cvc_inputs:
+                            try:
+                                placeholder = await inp.get_attribute('placeholder')
+                                name = await inp.get_attribute('name')
+                                
+                                if any(x for x in ['cvc', 'cvv', 'security'] if x in (placeholder or '').lower()) or \
+                                   name in ['cvc', 'cardCvc', 'cc-csc']:
+                                    await inp.click()
+                                    for digit in card['cvv']:
+                                        await inp.type(digit, delay=random.randint(50, 100))
+                                    filled_status["cvc"] = True
+                                    print("[FILLED] CVC in iframe")
+                                    await page.keyboard.press('Tab')
+                                    break
+                            except:
+                                continue
+                    
+                    # Postal code
+                    if not filled_status["postal"]:
+                        postal_inputs = await frame.query_selector_all('input')
+                        for inp in postal_inputs:
+                            try:
+                                placeholder = await inp.get_attribute('placeholder')
+                                name = await inp.get_attribute('name')
+                                
+                                if any(x for x in ['zip', 'postal'] if x in (placeholder or '').lower()) or \
+                                   name in ['postalCode', 'postal', 'zip']:
+                                    await inp.click()
+                                    await inp.fill('10001')
+                                    filled_status["postal"] = True
+                                    print("[FILLED] Postal code in iframe")
+                                    break
+                            except:
+                                continue
+                                
+                except Exception as e:
+                    print(f"[FRAME ERROR] {e}")
+                    continue
             
-            # Wait for Stripe response
-            print("\n[WAITING] Waiting for payment confirmation...")
+            # APPROACH 3: Use JavaScript injection as fallback
+            if not all(filled_status.values()):
+                print("\n[APPROACH 3] Using JavaScript injection...")
+                
+                for frame in page.frames:
+                    try:
+                        # Try to fill using JavaScript
+                        if not filled_status["card"]:
+                            await frame.evaluate(f'''
+                                const inputs = document.querySelectorAll('input');
+                                inputs.forEach(input => {{
+                                    if (input.placeholder && input.placeholder.toLowerCase().includes('card number')) {{
+                                        input.value = '{card["number"]}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    }}
+                                }});
+                            ''')
+                        
+                        if not filled_status["expiry"]:
+                            await frame.evaluate(f'''
+                                const inputs = document.querySelectorAll('input');
+                                inputs.forEach(input => {{
+                                    if (input.placeholder && input.placeholder.toLowerCase().includes('mm')) {{
+                                        input.value = '{card["month"]}/{card["year"][-2:]}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    }}
+                                }});
+                            ''')
+                        
+                        if not filled_status["cvc"]:
+                            await frame.evaluate(f'''
+                                const inputs = document.querySelectorAll('input');
+                                inputs.forEach(input => {{
+                                    if (input.placeholder && (input.placeholder.toLowerCase().includes('cvc') || input.placeholder.toLowerCase().includes('cvv'))) {{
+                                        input.value = '{card["cvv"]}';
+                                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    }}
+                                }});
+                            ''')
+                        
+                    except:
+                        continue
+            
+            print(f"\n[FILL STATUS] {filled_status}")
+            
+            # Wait before hCaptcha
+            await page.wait_for_timeout(2000)
+            
+            # APPROACH 4: Handle hCaptcha
+            print("\n[APPROACH 4] Handling hCaptcha...")
+            hcaptcha_solved = False
+            
+            # Look for hCaptcha checkbox
+            for frame in page.frames:
+                if 'hcaptcha.com' in frame.url and 'checkbox' in frame.url:
+                    print("[HCAPTCHA] Found checkbox iframe")
+                    try:
+                        # Click checkbox
+                        checkbox = await frame.query_selector('#checkbox')
+                        if checkbox:
+                            await checkbox.click()
+                            print("[HCAPTCHA] Clicked checkbox")
+                            
+                            # Wait to see if auto-solved
+                            await page.wait_for_timeout(5000)
+                            
+                            # Check for challenge
+                            challenge_found = False
+                            for cf in page.frames:
+                                if 'hcaptcha.com' in cf.url and 'challenge' in cf.url:
+                                    challenge_found = True
+                                    print("[HCAPTCHA] Challenge appeared, selecting random images...")
+                                    
+                                    # Wait for images to load
+                                    await page.wait_for_timeout(2000)
+                                    
+                                    # Find and click random images
+                                    task_images = await cf.query_selector_all('.task-image, .task, [role="button"]')
+                                    if task_images:
+                                        print(f"[HCAPTCHA] Found {len(task_images)} images")
+                                        # Select random 3-4 images
+                                        num_select = random.randint(3, min(4, len(task_images)))
+                                        indices = random.sample(range(len(task_images)), num_select)
+                                        
+                                        for idx in indices:
+                                            await task_images[idx].click()
+                                            print(f"[HCAPTCHA] Selected image {idx + 1}")
+                                            await page.wait_for_timeout(random.randint(500, 1000))
+                                        
+                                        # Click submit
+                                        submit_btns = await cf.query_selector_all('.button-submit, button')
+                                        for btn in submit_btns:
+                                            btn_text = await btn.text_content()
+                                            if 'verify' in (btn_text or '').lower() or 'submit' in (btn_text or '').lower():
+                                                await btn.click()
+                                                print("[HCAPTCHA] Clicked verify")
+                                                await page.wait_for_timeout(3000)
+                                                break
+                                    break
+                            
+                            if not challenge_found:
+                                print("[HCAPTCHA] Auto-solved!")
+                                hcaptcha_solved = True
+                                
+                    except Exception as e:
+                        print(f"[HCAPTCHA ERROR] {e}")
+                    break
+            
+            # Wait after hCaptcha
+            await page.wait_for_timeout(2000)
+            
+            # APPROACH 5: Multiple submit strategies
+            print("\n[APPROACH 5] Attempting to submit payment...")
+            submit_attempted = False
+            
+            # Strategy 1: Click visible submit button
+            submit_selectors = [
+                'button[type="submit"]:visible',
+                'button:has-text("Pay"):visible',
+                'button:has-text("Submit"):visible',
+                'button:has-text("Complete"):visible',
+                '.SubmitButton:visible',
+                'button[data-testid*="submit"]:visible'
+            ]
+            
+            for selector in submit_selectors:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.count() > 0:
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click()
+                        submit_attempted = True
+                        print(f"[SUBMIT] Clicked button: {selector}")
+                        break
+                except:
+                    continue
+            
+            # Strategy 2: Submit form directly
+            if not submit_attempted:
+                try:
+                    await page.evaluate('''
+                        const forms = document.querySelectorAll('form');
+                        forms.forEach(form => {
+                            if (form.querySelector('input[type="submit"]') || form.querySelector('button[type="submit"]')) {
+                                form.submit();
+                            }
+                        });
+                    ''')
+                    submit_attempted = True
+                    print("[SUBMIT] Triggered form submit via JavaScript")
+                except:
+                    pass
+            
+            # Strategy 3: Press Enter key
+            if not submit_attempted:
+                try:
+                    await page.keyboard.press('Enter')
+                    submit_attempted = True
+                    print("[SUBMIT] Pressed Enter key")
+                except:
+                    pass
+            
+            if submit_attempted:
+                # Wait for payment processing
+                print("\n[PROCESSING] Waiting for payment to process...")
+                await page.wait_for_timeout(10000)
+                
+                # Check if we need to handle hCaptcha again
+                for frame in page.frames:
+                    if 'hcaptcha.com' in frame.url and 'checkbox' in frame.url:
+                        try:
+                            checkbox = await frame.query_selector('#checkbox')
+                            if checkbox and await checkbox.is_visible():
+                                await checkbox.click()
+                                print("[HCAPTCHA] Clicked checkbox after submit")
+                                await page.wait_for_timeout(5000)
+                        except:
+                            pass
+                        break
+                
+                # Try submit again if needed
+                for selector in submit_selectors[:3]:
+                    try:
+                        btn = page.locator(selector).first
+                        if await btn.count() > 0 and await btn.is_visible():
+                            await btn.click()
+                            print(f"[SUBMIT RETRY] Clicked {selector}")
+                            break
+                    except:
+                        continue
+            
+            # Wait for final response
+            print("\n[WAITING] Monitoring for payment confirmation...")
             start_time = time.time()
             
             while time.time() - start_time < CONFIG["RESPONSE_TIMEOUT_SECONDS"]:
-                # Check if we got a token or payment confirmation
-                if stripe_result.get("token_created") or stripe_result.get("payment_confirmed"):
-                    print("[SUCCESS] Payment token or confirmation received!")
+                # Check for actual payment processing
+                if stripe_result.get("token_created") or stripe_result.get("payment_intent_created") or stripe_result.get("payment_confirmed"):
+                    print("[SUCCESS] Payment processing detected!")
                     break
                 
-                # Check for 3DS redirect
+                # Check URL for success indicators
                 current_url = page.url
-                if any(term in current_url.lower() for term in ['3ds', 'three-d-secure', 'authenticate']):
-                    print("[3DS] Three-D Secure authentication detected")
+                if any(x in current_url.lower() for x in ['success', 'thank', 'confirm', 'complete']):
+                    print(f"[URL] Success page detected: {current_url}")
+                    stripe_result["success_page"] = True
+                
+                # Check for 3DS
+                if '3d' in current_url.lower() or 'authenticate' in current_url.lower():
+                    print("[3DS] Three-D Secure detected")
                     stripe_result["requires_3ds"] = True
                     break
                 
-                # Check for success/error messages on page
+                # Check for error messages
                 try:
-                    # Success indicators
-                    success_texts = ['success', 'thank you', 'payment successful', 'confirmed', 'complete']
-                    page_text = await page.content()
-                    page_text_lower = page_text.lower()
-                    
-                    for success_text in success_texts:
-                        if success_text in page_text_lower:
-                            print(f"[SUCCESS] Found '{success_text}' in page content")
-                            stripe_result["success"] = True
-                            stripe_result["message"] = f"Payment appears successful (found: {success_text})"
-                            break
-                    
-                    # Check for specific error messages
-                    error_element = await page.query_selector('[role="alert"], .StripeError, .error-message')
-                    if error_element:
+                    error_element = await page.query_selector('[role="alert"], .StripeError, .error-message, .decline-message')
+                    if error_element and await error_element.is_visible():
                         error_text = await error_element.text_content()
-                        print(f"[ERROR] Found error message: {error_text}")
-                        stripe_result["error"] = error_text
-                        break
-                        
+                        if error_text and len(error_text) > 5:
+                            print(f"[ERROR] {error_text}")
+                            stripe_result["page_error"] = error_text
+                            break
                 except:
                     pass
                 
                 await asyncio.sleep(0.5)
             
-            # Take screenshot for debugging
+            # Take final screenshot
             if CONFIG["RUN_LOCAL"]:
-                screenshot = await page.screenshot(full_page=True)
-                print(f"[SCREENSHOT] Captured final state ({len(screenshot)} bytes)")
+                await page.screenshot(path="final.png", full_page=True)
+                print("[SCREENSHOT] Final page captured")
             
-            # Prepare final response
-            if stripe_result.get("success"):
+            # Prepare comprehensive response
+            if stripe_result.get("payment_confirmed") or stripe_result.get("token_created"):
                 return {
                     "success": True,
-                    "message": stripe_result.get("message", "Payment successful"),
+                    "message": stripe_result.get("message", "Payment processed"),
                     "token_id": stripe_result.get("token_id"),
-                    "hcaptcha_handled": stripe_result.get("hcaptcha_handled"),
+                    "payment_intent": stripe_result.get("payment_intent_created"),
+                    "hcaptcha_passes": len(stripe_result.get("hcaptcha_passes", [])),
                     "raw_responses": stripe_result["raw_responses"]
                 }
-            elif stripe_result.get("token_created"):
-                return {
-                    "success": True,
-                    "message": "Token created successfully",
-                    "token_id": stripe_result.get("token_id"),
-                    "hcaptcha_handled": stripe_result.get("hcaptcha_handled"),
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-            elif stripe_result.get("error"):
+            elif stripe_result.get("error") or stripe_result.get("page_error"):
                 return {
                     "success": False,
-                    "error": stripe_result.get("error"),
+                    "error": stripe_result.get("error") or stripe_result.get("page_error"),
                     "decline_code": stripe_result.get("decline_code"),
-                    "hcaptcha_handled": stripe_result.get("hcaptcha_handled"),
                     "raw_responses": stripe_result["raw_responses"]
                 }
             elif stripe_result.get("requires_3ds"):
@@ -732,25 +713,17 @@ async def run_stripe_automation(url, cc_string, email=None):
                     "raw_responses": stripe_result["raw_responses"]
                 }
             else:
-                # No clear result - check raw responses for clues
-                has_token = any('tokens' in r.get('url', '') for r in stripe_result.get("raw_responses", []))
-                has_intent = any('payment_intent' in r.get('url', '') for r in stripe_result.get("raw_responses", []))
-                
+                # No clear result
                 return {
                     "success": False,
-                    "message": "Payment processing unclear",
+                    "message": "Payment not processed - check raw responses",
                     "details": {
-                        "submit_clicked": submit_clicked,
-                        "hcaptcha_handled": stripe_result.get("hcaptcha_handled"),
-                        "token_attempt": has_token,
-                        "payment_intent_attempt": has_intent,
-                        "filled_fields": {
-                            "email": email_filled,
-                            "card": card_filled,
-                            "expiry": expiry_filled,
-                            "cvc": cvc_filled,
-                            "postal": postal_filled
-                        }
+                        "email_filled": email_filled,
+                        "card_filled": filled_status,
+                        "hcaptcha_attempted": hcaptcha_solved,
+                        "submit_attempted": submit_attempted,
+                        "hcaptcha_passes": len(stripe_result.get("hcaptcha_passes", [])),
+                        "responses_captured": len(stripe_result.get("raw_responses", []))
                     },
                     "raw_responses": stripe_result["raw_responses"]
                 }
@@ -782,16 +755,14 @@ async def run_stripe_automation(url, cc_string, email=None):
                     pass
             print("[CLEANUP] Browser session closed")
 
-# === API ENDPOINTS ===
+# === API ENDPOINT ===
 @app.route('/hrkXstripe', methods=['GET'])
 def stripe_endpoint():
-    # Check rate limit
     can_proceed, wait_time = rate_limit_check()
     if not can_proceed:
         return jsonify({
             "error": "Rate limit exceeded",
-            "retry_after": f"{wait_time:.1f} seconds",
-            "message": f"Maximum {CONFIG['RATE_LIMIT_REQUESTS']} requests per {CONFIG['RATE_LIMIT_WINDOW']} seconds"
+            "retry_after": f"{wait_time:.1f} seconds"
         }), 429
     
     url = request.args.get('url')
@@ -808,7 +779,6 @@ def stripe_endpoint():
     if not url or not cc:
         return jsonify({"error": "Missing required parameters: url and cc"}), 400
     
-    # Run async function
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
@@ -837,12 +807,7 @@ def status_endpoint():
         "status": "online",
         "rate_limit": {
             "requests_made": len(request_timestamps),
-            "requests_remaining": CONFIG["RATE_LIMIT_REQUESTS"] - len(request_timestamps),
-            "window_seconds": CONFIG["RATE_LIMIT_WINDOW"]
-        },
-        "config": {
-            "run_local": CONFIG["RUN_LOCAL"],
-            "has_api_key": bool(CONFIG["BROWSERLESS_API_KEY"])
+            "requests_remaining": CONFIG["RATE_LIMIT_REQUESTS"] - len(request_timestamps)
         },
         "timestamp": datetime.now().isoformat()
     })
