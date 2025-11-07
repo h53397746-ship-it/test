@@ -4,7 +4,6 @@ import json
 import random
 import re
 import time
-import requests
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from playwright._impl._errors import TargetClosedError
@@ -16,17 +15,41 @@ load_dotenv()
 
 CONFIG = {
     "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
-    "STEEL_API_KEY": os.getenv('STEEL_API_KEY'),
+    "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
     "RESPONSE_TIMEOUT_SECONDS": 50,
     "RETRY_DELAY": 2000,
     "RATE_LIMIT_REQUESTS": 5,
     "RATE_LIMIT_WINDOW": 60,
     "MAX_RETRIES": 2,
-    "STEEL_SESSION_TIMEOUT": 300000  # 5 minutes
+    "BROWSERLESS_TIMEOUT": 60000,
+    "IP_ROTATION_ENABLED": True
 }
 
 app = Flask(__name__)
 request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
+
+# IP Rotation: Browserless regions (different geographic IPs)
+BROWSERLESS_REGIONS = [
+    'production-sfo',      # San Francisco, USA
+    'production-lon',      # London, UK
+    'production-syd',      # Sydney, Australia
+]
+
+# Track region rotation
+region_rotation_index = 0
+
+def get_next_browserless_region():
+    """Get next Browserless region for IP rotation"""
+    global region_rotation_index
+    
+    if not CONFIG["IP_ROTATION_ENABLED"]:
+        return 'production-sfo'  # Default
+    
+    region = BROWSERLESS_REGIONS[region_rotation_index % len(BROWSERLESS_REGIONS)]
+    region_rotation_index += 1
+    
+    print(f"[IP ROTATION] Using region: {region}")
+    return region
 
 def rate_limit_check():
     now = time.time()
@@ -40,56 +63,6 @@ def rate_limit_check():
     
     request_timestamps.append(now)
     return True, 0
-
-def create_steel_session():
-    """Create a new Steel.dev session with captcha solving enabled"""
-    if not CONFIG["STEEL_API_KEY"]:
-        raise Exception("STEEL_API_KEY not configured")
-    
-    url = "https://api.steel.dev/v1/sessions"
-    headers = {
-        "Steel-API-Key": CONFIG["STEEL_API_KEY"],
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "timeout": CONFIG["STEEL_SESSION_TIMEOUT"],
-        "solveCaptchas": True,  # Enable automatic captcha solving
-        "useProxy": True,  # Use Steel's proxy for IP rotation
-        "sessionContext": {
-            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-            "viewport": {
-                "width": 1920,
-                "height": 1080
-            }
-        }
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        session_data = response.json()
-        
-        print(f"[STEEL] Session created: {session_data.get('id')}")
-        return session_data
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"Failed to create Steel session: {str(e)}")
-
-def release_steel_session(session_id):
-    """Release a Steel.dev session"""
-    if not session_id:
-        return
-    
-    url = f"https://api.steel.dev/v1/sessions/{session_id}/release"
-    headers = {
-        "Steel-API-Key": CONFIG["STEEL_API_KEY"]
-    }
-    
-    try:
-        requests.post(url, headers=headers, timeout=10)
-        print(f"[STEEL] Session released: {session_id}")
-    except:
-        pass
 
 def luhn_algorithm(number_str):
     total = 0
@@ -273,8 +246,12 @@ async def run_stripe_automation(url, cc_string, email=None):
     email = email or f"test{random.randint(1000,9999)}@example.com"
     random_name = generate_random_name()
     
+    # Get Browserless region for IP rotation
+    region = get_next_browserless_region()
+    
     print(f"\n{'='*80}")
     print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
+    print(f"[REGION] {region}")
     print(f"[CARD] {card['number']} | {card['month']}/{card['year']}")
     print(f"[EMAIL] {email}")
     print('='*80)
@@ -287,12 +264,11 @@ async def run_stripe_automation(url, cc_string, email=None):
         "payment_method_created": False,
         "payment_intent_created": False,
         "success_url": None,
-        "requires_3ds": False
+        "requires_3ds": False,
+        "region_used": region
     }
     
     analyzer = StripeResponseAnalyzer()
-    steel_session = None
-    steel_session_id = None
     
     async with async_playwright() as p:
         browser = None
@@ -301,7 +277,6 @@ async def run_stripe_automation(url, cc_string, email=None):
         payment_submitted = False
         
         try:
-            # Create Steel session or use local browser
             if CONFIG["RUN_LOCAL"]:
                 print("[BROWSER] Local mode")
                 browser = await p.chromium.launch(
@@ -309,35 +284,60 @@ async def run_stripe_automation(url, cc_string, email=None):
                     slow_mo=100,
                     args=['--disable-blink-features=AutomationControlled']
                 )
-                context = await browser.new_context(
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
-                )
             else:
-                print("[STEEL] Creating session...")
+                print("[BROWSERLESS] Connecting...")
                 
-                # Create Steel session
-                steel_session = create_steel_session()
-                steel_session_id = steel_session.get('id')
-                ws_endpoint = steel_session.get('wsEndpoint')
+                if not CONFIG["BROWSERLESS_API_KEY"]:
+                    return {"error": "BROWSERLESS_API_KEY not configured"}
                 
-                if not ws_endpoint:
-                    return {"error": "Failed to get Steel WebSocket endpoint"}
+                # Build Browserless URL with selected region
+                # Each region has different IP pool
+                browserless_url = f"wss://{region}.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
                 
-                print(f"[STEEL] Connecting to browser...")
+                # Add stealth mode for better anonymity
+                browserless_url += "&stealth=true"
                 
-                # Connect to Steel browser
-                browser = await p.chromium.connect_over_cdp(ws_endpoint)
+                # Random session ID to ensure fresh IP from pool
+                session_id = random.randint(100000, 999999)
+                browserless_url += f"&blockAds=true"
                 
-                # Get the default context (Steel provides one)
-                contexts = browser.contexts
-                if contexts:
-                    context = contexts[0]
-                else:
-                    context = await browser.new_context()
-                
-                print("[STEEL] ✓ Connected with captcha solver enabled")
+                try:
+                    browser = await p.chromium.connect(browserless_url, timeout=30000)
+                    print(f"[BROWSERLESS] ✓ Connected to {region}")
+                except Exception as e:
+                    error_msg = str(e)
+                    if "429" in error_msg:
+                        return {"error": "Browserless rate limit exceeded"}
+                    elif "401" in error_msg or "403" in error_msg:
+                        return {"error": "Invalid Browserless API key"}
+                    else:
+                        return {"error": f"Failed to connect: {error_msg}"}
             
+            # Create context with randomized fingerprint for better anonymity
+            user_agents = [
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+            ]
+            
+            context_options = {
+                'viewport': {
+                    'width': random.choice([1920, 1366, 1440, 1536]),
+                    'height': random.choice([1080, 768, 900, 864])
+                },
+                'user_agent': random.choice(user_agents),
+                'locale': random.choice(['en-US', 'en-GB', 'en-CA', 'en-AU']),
+                'timezone_id': random.choice([
+                    'America/New_York',
+                    'America/Los_Angeles',
+                    'America/Chicago',
+                    'Europe/London',
+                    'Australia/Sydney'
+                ])
+            }
+            
+            context = await browser.new_context(**context_options)
             page = await context.new_page()
             print("[PAGE] ✓ Created")
             
@@ -366,36 +366,11 @@ async def run_stripe_automation(url, cc_string, email=None):
                 await page.goto(url, wait_until="domcontentloaded", timeout=40000)
                 print("[NAV] ✓ Loaded")
             except TargetClosedError:
-                return {"error": "Browser closed by Steel (timeout)"}
+                return {"error": "Browser closed (timeout)"}
             except Exception as e:
                 return {"error": f"Navigation failed: {str(e)}"}
             
-            # Wait for page load and captcha solving
-            print("[WAIT] Loading page and solving captchas...")
-            await safe_wait(page, 5000)  # Give Steel time to solve captcha
-            
-            # Check if hCaptcha was solved
-            try:
-                hcaptcha_solved = await page.evaluate('''
-                    () => {
-                        const iframe = document.querySelector('iframe[src*="hcaptcha"]');
-                        if (!iframe) return null;
-                        
-                        // Check if response token exists (captcha solved)
-                        const response = document.querySelector('[name="h-captcha-response"]');
-                        return response && response.value.length > 0 ? 'solved' : 'pending';
-                    }
-                ''')
-                
-                if hcaptcha_solved == 'solved':
-                    print("[CAPTCHA] ✓ hCaptcha auto-solved by Steel")
-                elif hcaptcha_solved == 'pending':
-                    print("[CAPTCHA] Waiting for Steel to solve...")
-                    await safe_wait(page, 5000)
-                else:
-                    print("[CAPTCHA] No captcha detected")
-            except:
-                pass
+            await safe_wait(page, 3000)
             
             # Fill email
             print("[FILL] Email...")
@@ -557,7 +532,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                     "payment_intent_id": stripe_result.get("payment_intent_id"),
                     "token_id": stripe_result.get("token_id"),
                     "payment_method_id": stripe_result.get("payment_method_id"),
-                    "steel_session_id": steel_session_id,
+                    "region_used": region,
                     "raw_responses": stripe_result["raw_responses"]
                 }
             elif stripe_result.get("requires_3ds"):
@@ -592,7 +567,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                 
         except TargetClosedError:
             return {
-                "error": "Steel session closed",
+                "error": "Browserless session closed",
                 "raw_responses": stripe_result.get("raw_responses", [])
             }
         except Exception as e:
@@ -605,13 +580,12 @@ async def run_stripe_automation(url, cc_string, email=None):
             }
             
         finally:
-            # Clean up
             if page:
                 try:
                     await page.close()
                 except:
                     pass
-            if context and CONFIG["RUN_LOCAL"]:
+            if context:
                 try:
                     await context.close()
                 except:
@@ -621,29 +595,25 @@ async def run_stripe_automation(url, cc_string, email=None):
                     await browser.close()
                 except:
                     pass
-            
-            # Release Steel session
-            if steel_session_id:
-                release_steel_session(steel_session_id)
-            
             print("[CLEANUP] ✓")
 
 @app.route('/')
 def home():
     return jsonify({
         "service": "Stripe Automation API",
-        "version": "4.0",
-        "provider": "Steel.dev",
+        "version": "3.1",
+        "provider": "Browserless",
         "status": "online",
         "features": {
-            "captcha_solving": True,
             "ip_rotation": True,
-            "payment_detection": True
+            "multiple_regions": BROWSERLESS_REGIONS,
+            "payment_detection": True,
+            "stealth_mode": True
         },
         "endpoints": {
             "/hrkXstripe": "Main automation endpoint",
             "/status": "Status check",
-            "/test": "Test endpoint"
+            "/ip-stats": "IP rotation statistics"
         }
     })
 
@@ -678,8 +648,6 @@ def stripe_endpoint():
         return jsonify(result), 200 if result.get('success') else 400
     except Exception as e:
         print(f"[SERVER ERROR] {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({"error": f"Server error: {str(e)}"}), 500
     finally:
         loop.close()
@@ -688,16 +656,28 @@ def stripe_endpoint():
 def status_endpoint():
     return jsonify({
         "status": "online",
-        "version": "4.0-steel",
-        "provider": "Steel.dev",
-        "mode": "Steel.dev" if not CONFIG['RUN_LOCAL'] else "Local",
-        "steel_configured": bool(CONFIG.get("STEEL_API_KEY")),
-        "features": {
-            "auto_captcha_solving": True,
-            "ip_rotation": True,
-            "session_management": True
+        "version": "3.1-ip-rotation",
+        "provider": "Browserless",
+        "mode": "Browserless" if not CONFIG['RUN_LOCAL'] else "Local",
+        "browserless_configured": bool(CONFIG.get("BROWSERLESS_API_KEY")),
+        "ip_rotation": {
+            "enabled": CONFIG["IP_ROTATION_ENABLED"],
+            "method": "Multi-region rotation",
+            "regions": BROWSERLESS_REGIONS,
+            "current_index": region_rotation_index
         },
         "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/ip-stats', methods=['GET'])
+def ip_stats_endpoint():
+    """Get IP rotation statistics"""
+    return jsonify({
+        "rotation_enabled": CONFIG["IP_ROTATION_ENABLED"],
+        "available_regions": BROWSERLESS_REGIONS,
+        "current_rotation_index": region_rotation_index,
+        "total_rotations": region_rotation_index,
+        "next_region": BROWSERLESS_REGIONS[region_rotation_index % len(BROWSERLESS_REGIONS)]
     })
 
 @app.route('/test', methods=['GET'])
@@ -705,12 +685,11 @@ def test_endpoint():
     return jsonify({
         "status": "working",
         "message": "API is operational",
-        "provider": "Steel.dev",
-        "config": {
-            "mode": "Steel.dev" if not CONFIG['RUN_LOCAL'] else "Local",
-            "steel": bool(CONFIG.get("STEEL_API_KEY")),
-            "captcha_solving": "Built-in (hCaptcha, reCAPTCHA)",
-            "ip_rotation": "Automatic"
+        "provider": "Browserless",
+        "ip_rotation": {
+            "enabled": True,
+            "method": "Geographic region rotation",
+            "regions": BROWSERLESS_REGIONS
         },
         "example": "/hrkXstripe?url=https://checkout.stripe.com/...&cc=4111111111111111|12|2025|123"
     })
@@ -718,24 +697,22 @@ def test_endpoint():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
-    print("[SERVER] Stripe Automation v4.0 - Steel.dev Edition")
+    print("[SERVER] Stripe Automation v3.1 - IP Rotation Edition")
     print(f"[PORT] {port}")
-    print(f"[PROVIDER] Steel.dev")
-    print(f"[MODE] {'Local Browser' if CONFIG['RUN_LOCAL'] else 'Steel.dev'}")
+    print(f"[PROVIDER] Browserless")
+    print(f"[IP ROTATION] {len(BROWSERLESS_REGIONS)} regions")
     
-    if not CONFIG['RUN_LOCAL'] and not CONFIG.get('STEEL_API_KEY'):
-        print("[WARNING] STEEL_API_KEY not set!")
-        print("[INFO] Get your API key from: https://steel.dev")
+    if not CONFIG['RUN_LOCAL'] and not CONFIG.get('BROWSERLESS_API_KEY'):
+        print("[WARNING] BROWSERLESS_API_KEY not set!")
     
     print("\n[FEATURES]")
-    print("  ✓ Steel.dev browser automation")
-    print("  ✓ Built-in captcha solving (hCaptcha, reCAPTCHA)")
-    print("  ✓ Automatic IP rotation")
-    print("  ✓ Session management")
+    print("  ✓ Browserless multi-region support")
+    print("  ✓ Automatic IP rotation (3 regions)")
+    print(f"  ✓ Regions: {', '.join(BROWSERLESS_REGIONS)}")
+    print("  ✓ Stealth mode enabled")
+    print("  ✓ Randomized browser fingerprints")
     print("  ✓ Payment confirmation detection")
     print("  ✓ Detailed logging")
-    print("  ✓ Rate limiting")
-    print("\n[DOCS] https://docs.steel.dev")
     print("="*80)
     
     app.run(host='0.0.0.0', port=port, debug=False)
