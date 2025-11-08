@@ -3,3 +3,4 @@ gunicorn
 playwright
 requests
 python-dotenv
+httpx
