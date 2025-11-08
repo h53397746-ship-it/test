@@ -4,14 +4,14 @@
 
 # --- Required for Headless Mode ---
 # Get this from your Browserless.io account dashboard.
-BROWSERLESS_API_KEY="2TNZbWFae97Dw801a99f891461be50aa9e164017373a1d98d"
+BROWSERLESS_API_KEY=""
 
 # --- Required for Telegram Notifications ---
 # Get this from Telegram's BotFather.
-BOT_TOKEN="7212733015:AAFtgLgIFEfTFHbyd-095DtnSezkExUA8fU"
+BOT_TOKEN=""
 
 # The chat ID where hit notifications will be sent.
-DEFAULT_CHAT_ID="-1003067380709"
+DEFAULT_CHAT_ID=""
 
 # --- Optional for Local Development ---
 # Port for the Flask server to run on locally.
