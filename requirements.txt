@@ -4,3 +4,63 @@ playwright
 requests
 python-dotenv
 httpx
+
+# === CORE DEPENDENCIES ===
+flask-cors==4.0.0
+aiohttp==3.9.1
+
+# === OPTIONAL - FOR PRODUCTION ===
+# Production WSGI Server
+gunicorn==21.2.0
+
+# Environment Management
+python-dotenv==1.0.0
+
+# Security Headers
+secure==0.3.0
+
+# Request Rate Limiting
+Flask-Limiter==3.5.0
+
+# Caching
+Flask-Caching==2.1.0
+redis==5.0.1
+
+# Monitoring and Logging
+flask-log-request-id==0.10.1
+python-json-logger==2.0.7
+
+# === OPTIONAL - FOR ENHANCED FEATURES ===
+# Data Processing
+pandas==2.1.4
+numpy==1.26.2
+
+# Excel Export Support
+openpyxl==3.1.2
+XlsxWriter==3.1.9
+
+# Database Support (if needed)
+SQLAlchemy==2.0.23
+Flask-SQLAlchemy==3.1.1
+
+# API Documentation
+flasgger==0.9.7.1
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-flask==1.3.0
+coverage==7.3.2
+
+# Code Quality
+black==23.12.0
+flake8==6.1.0
+pylint==3.0.3
+
+# === OPTIONAL - FOR DEVELOPMENT ===
+# Development Tools
+ipython==8.18.1
+flask-debugtoolbar==0.13.1
+
+# Hot Reload
+watchdog==3.0.0
