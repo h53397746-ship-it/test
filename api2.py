@@ -1,912 +1,1231 @@
-import os
-import asyncio
+#!/usr/bin/env python3
+"""
+Payment Gateway Tester - All-in-One Script
+Run: python payment_tester.py
+Then open: http://localhost:5000
+"""
+
 import json
-import random
 import re
+import random
 import time
-from datetime import datetime
-from urllib.parse import quote
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright._impl._errors import TargetClosedError
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-from collections import deque
+import asyncio
+import hashlib
+import base64
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Any
+from enum import Enum
+import threading
+import webbrowser
+import os
+import sys
 
-load_dotenv()
+# Flask imports
+try:
+    from flask import Flask, render_template_string, jsonify, request, send_file
+    from flask_cors import CORS
+    import aiohttp
+except ImportError:
+    print("Installing required packages...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "flask", "flask-cors", "aiohttp"])
+    from flask import Flask, render_template_string, jsonify, request, send_file
+    from flask_cors import CORS
+    import aiohttp
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-CONFIG = {
-    "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
-    "BROWSERSTACK_USERNAME": os.getenv('BROWSERSTACK_USERNAME'),
-    "BROWSERSTACK_ACCESS_KEY": os.getenv('BROWSERSTACK_ACCESS_KEY'),
-    "BROWSERSTACK_TIMEOUT": int(os.getenv('BROWSERSTACK_TIMEOUT', '60000')),
-    "RESPONSE_TIMEOUT_SECONDS": 50,
-    "RETRY_DELAY": 2000,
-    "RATE_LIMIT_REQUESTS": 5,
-    "RATE_LIMIT_WINDOW": 60,
-    "MAX_RETRIES": 2,
-}
-
-# Validate BrowserStack credentials
-if not CONFIG["RUN_LOCAL"]:
-    if not CONFIG["BROWSERSTACK_USERNAME"] or not CONFIG["BROWSERSTACK_ACCESS_KEY"]:
-        print("⚠️  WARNING: BROWSERSTACK_USERNAME and BROWSERSTACK_ACCESS_KEY not set!")
-        print("Set RUN_LOCAL=true to use local browser instead")
-
+# Initialize Flask app
 app = Flask(__name__)
-request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
+CORS(app)
 
 # ============================================================================
-# RATE LIMITING
+# DATA MODELS AND BUSINESS LOGIC
 # ============================================================================
 
-def rate_limit_check():
-    """Check if request is within rate limit"""
-    now = time.time()
-    while request_timestamps and request_timestamps[0] < now - CONFIG["RATE_LIMIT_WINDOW"]:
-        request_timestamps.popleft()
+@dataclass
+class CardDetails:
+    number: str
+    month: str
+    year: str
+    cvv: str
+    brand: str = ""
     
-    if len(request_timestamps) >= CONFIG["RATE_LIMIT_REQUESTS"]:
-        oldest = request_timestamps[0]
-        wait_time = CONFIG["RATE_LIMIT_WINDOW"] - (now - oldest)
-        return False, wait_time
+    def __post_init__(self):
+        self.brand = self.detect_brand()
     
-    request_timestamps.append(now)
-    return True, 0
-
-# ============================================================================
-# CARD UTILITIES
-# ============================================================================
-
-def luhn_algorithm(number_str):
-    """Validate card number using Luhn algorithm"""
-    total = 0
-    reverse_digits = number_str[::-1]
-    for i, digit in enumerate(reverse_digits):
-        n = int(digit)
-        if (i % 2) == 1:
-            n *= 2
-            if n > 9:
-                n -= 9
-        total += n
-    return total % 10 == 0
-
-def complete_luhn(base):
-    """Complete card number with valid Luhn checksum"""
-    for d in range(10):
-        candidate = base + str(d)
-        if luhn_algorithm(candidate):
-            return candidate
-    return None
-
-def get_card_length(bin_str):
-    """Determine card length based on BIN"""
-    first_two = bin_str[:2] if len(bin_str) >= 2 else ""
-    return 15 if first_two in ['34', '37'] else 16
-
-def get_cvv_length(card_number):
-    """Determine CVV length based on card number"""
-    return 4 if len(card_number) == 15 else 3
-
-def random_digit():
-    """Generate random digit"""
-    return str(random.randint(0, 9))
-
-def generate_card_from_pattern(pattern):
-    """Generate card number from pattern with x placeholders"""
-    clean_pattern = re.sub(r'[^0-9x]', '', pattern, flags=re.IGNORECASE)
-    card_length = get_card_length(clean_pattern.replace('x', '0'))
-    
-    result = ''
-    for char in clean_pattern:
-        if len(result) >= card_length - 1:
-            break
-        result += random_digit() if char.lower() == 'x' else char
-    
-    while len(result) < card_length - 1:
-        result += random_digit()
-    
-    result = result[:card_length - 1]
-    return complete_luhn(result) or result + '0'
-
-def process_card_with_placeholders(number, month, year, cvv):
-    """Process card details with placeholder handling"""
-    processed_number = generate_card_from_pattern(number) if 'x' in number.lower() else number
-    processed_month = str(random.randint(1, 12)).zfill(2) if 'x' in month.lower() else month.zfill(2)
-    
-    current_year = datetime.now().year
-    if 'x' in year.lower():
-        processed_year = str(random.randint(current_year + 1, current_year + 6))
-    elif len(year) == 2:
-        processed_year = '20' + year
-    else:
-        processed_year = year
-    
-    cvv_length = get_cvv_length(processed_number)
-    processed_cvv = ''.join([random_digit() for _ in range(cvv_length)]) if 'x' in cvv.lower() else cvv
-    
-    return {
-        "number": processed_number,
-        "month": processed_month,
-        "year": processed_year,
-        "cvv": processed_cvv
-    }
-
-def process_card_input(cc_string):
-    """Parse card input string (format: number|month|year|cvv)"""
-    parts = cc_string.split('|')
-    if len(parts) != 4:
-        return None
-    return process_card_with_placeholders(*parts)
-
-def generate_random_name():
-    """Generate random cardholder name"""
-    first_names = ['Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey', 'Riley', 'Avery', 'Quinn', 'Sage', 'Parker']
-    last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez']
-    return f"{random.choice(first_names)} {random.choice(last_names)}"
-
-# ============================================================================
-# STRIPE RESPONSE ANALYZER
-# ============================================================================
-
-class StripeResponseAnalyzer:
-    """Analyze Stripe API responses for payment status"""
-    
-    @staticmethod
-    def is_stripe_endpoint(url):
-        """Check if URL is a Stripe endpoint"""
-        return any(domain in url.lower() for domain in ['stripe.com', 'stripe.network'])
-    
-    @staticmethod
-    def is_payment_critical_endpoint(url):
-        """Check for payment-critical endpoints"""
-        critical = [
-            '/v1/payment_intents',
-            '/v1/payment_pages',
-            '/v1/tokens',
-            '/v1/payment_methods',
-            '/confirm',
-            '/v1/charges',
-            '/v1/setup_intents'
-        ]
-        return any(endpoint in url.lower() for endpoint in critical)
-    
-    @staticmethod
-    def analyze_response(url, status, body_text, result_dict):
-        """Analyze API response and update result dictionary"""
-        try:
-            data = json.loads(body_text)
-        except:
-            return
+    def detect_brand(self) -> str:
+        """Detect card brand from number"""
+        if not self.number:
+            return "unknown"
         
-        # Store ALL Stripe responses
-        result_dict["raw_responses"].append({
-            "url": url,
+        first = self.number[0]
+        first_two = self.number[:2] if len(self.number) >= 2 else ""
+        first_four = self.number[:4] if len(self.number) >= 4 else ""
+        
+        if first == '4':
+            return 'visa'
+        elif first_two in ['51', '52', '53', '54', '55']:
+            return 'mastercard'
+        elif first_two in ['34', '37']:
+            return 'amex'
+        elif first_two == '65' or first_four == '6011':
+            return 'discover'
+        elif first_two in ['36', '38']:
+            return 'diners'
+        elif first_four in ['3528', '3529', '3530', '3531', '3532', '3533', '3534', '3535']:
+            return 'jcb'
+        return 'unknown'
+    
+    def mask_number(self) -> str:
+        """Return masked card number"""
+        if len(self.number) >= 8:
+            return f"•••• {self.number[-4:]}"
+        return "•••• ••••"
+    
+    def validate_luhn(self) -> bool:
+        """Validate card number using Luhn algorithm"""
+        def digits_of(n):
+            return [int(d) for d in str(n)]
+        
+        try:
+            digits = digits_of(self.number)
+            odd_digits = digits[-1::-2]
+            even_digits = digits[-2::-2]
+            
+            checksum = sum(odd_digits)
+            for d in even_digits:
+                checksum += sum(digits_of(d * 2))
+            
+            return checksum % 10 == 0
+        except:
+            return False
+
+class CardParser:
+    """Parse cards from various formats"""
+    
+    @staticmethod
+    def parse_card(line: str) -> Optional[CardDetails]:
+        """Parse a single card line"""
+        line = line.strip()
+        if not line:
+            return None
+        
+        # Remove all non-essential characters for analysis
+        clean_line = re.sub(r'[^\d\s|/,:\-]', '', line)
+        
+        # Try different separators
+        separators = [r'\|', r'/', r'-', r',', r':', r'\s+']
+        parts = None
+        
+        for sep in separators:
+            temp_parts = re.split(sep, clean_line)
+            temp_parts = [p.strip() for p in temp_parts if p.strip()]
+            if len(temp_parts) == 4:
+                parts = temp_parts
+                break
+        
+        # Try continuous format (no separators)
+        if not parts:
+            numbers_only = re.sub(r'\D', '', line)
+            if len(numbers_only) >= 23:  # 16 + 2 + 2 + 3 minimum
+                parts = [
+                    numbers_only[:16],
+                    numbers_only[16:18],
+                    numbers_only[18:20],
+                    numbers_only[20:23]
+                ]
+        
+        if not parts or len(parts) != 4:
+            return None
+        
+        try:
+            # Clean and validate parts
+            card_number = re.sub(r'\D', '', parts[0])
+            if len(card_number) < 13 or len(card_number) > 19:
+                return None
+            
+            month = parts[1].zfill(2)
+            if not (1 <= int(month) <= 12):
+                return None
+            
+            year = parts[2]
+            if len(year) == 4:
+                year = year[-2:]  # Convert YYYY to YY
+            elif len(year) != 2:
+                return None
+            
+            cvv = re.sub(r'\D', '', parts[3])
+            if not (3 <= len(cvv) <= 4):
+                return None
+            
+            return CardDetails(
+                number=card_number,
+                month=month,
+                year=year,
+                cvv=cvv
+            )
+        except:
+            return None
+
+class PaymentSimulator:
+    """Simulate payment processing"""
+    
+    @staticmethod
+    async def process_payment(card: CardDetails, business_type: str) -> Dict[str, Any]:
+        """Simulate payment processing with realistic responses"""
+        
+        # Simulate processing delay
+        await asyncio.sleep(random.uniform(0.5, 2.0))
+        
+        # Validate card with Luhn
+        is_valid = card.validate_luhn()
+        
+        # Determine success based on card validation and random factors
+        if not is_valid:
+            success = False
+            status = "INVALID"
+            message = "Invalid card number"
+        else:
+            # Simulate different response scenarios
+            rand = random.random()
+            if rand < 0.6:  # 60% success rate
+                success = True
+                status = "APPROVED"
+                messages = [
+                    "Transaction approved",
+                    "Payment authorized successfully",
+                    "Transaction completed",
+                    "Payment processed"
+                ]
+                message = random.choice(messages)
+            elif rand < 0.75:  # 15% insufficient funds
+                success = False
+                status = "DECLINED"
+                message = "Insufficient funds"
+            elif rand < 0.85:  # 10% card declined
+                success = False
+                status = "DECLINED"
+                message = "Card declined by issuer"
+            elif rand < 0.95:  # 10% fraud
+                success = False
+                status = "FRAUD"
+                message = "Transaction flagged for review"
+            else:  # 5% other errors
+                success = False
+                status = "ERROR"
+                message = "Transaction could not be processed"
+        
+        # Determine amount based on business type
+        amount = "141.00" if business_type == "swiggy" else "726.00"
+        currency = "INR"
+        
+        return {
+            "success": success,
+            "card": card.mask_number(),
+            "full_card": f"{card.number}|{card.month}|{card.year}|{card.cvv}",
+            "brand": card.brand,
+            "amount": amount,
+            "currency": currency,
             "status": status,
-            "data": data,
-            "timestamp": datetime.now().isoformat()
+            "message": message,
+            "business_type": business_type,
+            "timestamp": datetime.now().isoformat(),
+            "transaction_id": f"TXN{random.randint(100000000, 999999999)}",
+            "auth_code": f"AUTH{random.randint(1000, 9999)}" if success else None,
+            "processing_time": round(random.uniform(0.5, 2.0), 2)
+        }
+
+# ============================================================================
+# WEB ROUTES
+# ============================================================================
+
+@app.route('/')
+def index():
+    """Serve the main application"""
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/process', methods=['POST'])
+def process_cards():
+    """Process multiple cards"""
+    try:
+        data = request.json
+        cards_text = data.get('cards', '')
+        business_type = data.get('businessType', 'swiggy')
+        
+        # Parse all cards
+        lines = cards_text.strip().split('\n')
+        cards = []
+        invalid_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if line:
+                card = CardParser.parse_card(line)
+                if card:
+                    cards.append(card)
+                else:
+                    invalid_lines.append(line)
+        
+        if not cards:
+            return jsonify({
+                'success': False,
+                'error': 'No valid cards found',
+                'invalid_lines': invalid_lines
+            }), 400
+        
+        # Process cards asynchronously
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def process_all():
+            tasks = [PaymentSimulator.process_payment(card, business_type) for card in cards]
+            return await asyncio.gather(*tasks)
+        
+        results = loop.run_until_complete(process_all())
+        loop.close()
+        
+        # Calculate statistics
+        total = len(results)
+        successful = sum(1 for r in results if r['success'])
+        failed = total - successful
+        
+        # Brand distribution
+        brands = {}
+        for r in results:
+            brand = r['brand']
+            brands[brand] = brands.get(brand, 0) + 1
+        
+        return jsonify({
+            'success': True,
+            'results': results,
+            'statistics': {
+                'total': total,
+                'successful': successful,
+                'failed': failed,
+                'success_rate': round((successful / total * 100) if total > 0 else 0, 2),
+                'brands': brands,
+                'invalid_lines': invalid_lines
+            }
         })
         
-        # Log payment-critical endpoints
-        if StripeResponseAnalyzer.is_payment_critical_endpoint(url):
-            print(f"[PAYMENT API] {url[:60]}... [{status}]")
-            print(f"[DATA] {json.dumps(data)[:300]}...")
-        
-        # Check for success_url
-        if data.get('success_url'):
-            result_dict["success_url"] = data['success_url']
-            print(f"[SUCCESS URL] {data['success_url']}")
-        
-        # Check for payment confirmation - EXPANDED CHECKS
-        is_payment_success = (
-            data.get('status') in ['succeeded', 'success', 'requires_capture', 'processing', 'complete'] or
-            data.get('payment_intent', {}).get('status') in ['succeeded', 'success', 'requires_capture', 'processing'] or
-            data.get('payment_status') in ['paid', 'complete'] or
-            data.get('outcome', {}).get('type') == 'authorized' or
-            (data.get('status') == 'complete' and 'payment_intent' in data) or
-            data.get('paid') == True or
-            (data.get('object') == 'setup_intent' and data.get('status') == 'succeeded')
-        )
-        
-        if is_payment_success:
-            result_dict["payment_confirmed"] = True
-            result_dict["success"] = True
-            result_dict["message"] = f"Payment {data.get('status', 'succeeded')}"
-            result_dict["payment_intent_id"] = (
-                data.get('id') or 
-                data.get('payment_intent', {}).get('id') or
-                data.get('payment_intent')
-            )
-            print(f"[✓✓✓ PAYMENT CONFIRMED] {data.get('status')}")
-            return
-        
-        # Check for token
-        if status == 200 and data.get('id', '').startswith('tok_'):
-            result_dict["token_created"] = True
-            result_dict["token_id"] = data.get('id')
-            print(f"[TOKEN] {data.get('id')}")
-        
-        # Check for payment method
-        if status == 200 and data.get('id', '').startswith('pm_'):
-            result_dict["payment_method_created"] = True
-            result_dict["payment_method_id"] = data.get('id')
-            print(f"[PAYMENT METHOD] {data.get('id')}")
-        
-        # Check for payment intent (but not confirmed yet)
-        if status == 200 and data.get('id', '').startswith('pi_'):
-            result_dict["payment_intent_created"] = True
-            result_dict["payment_intent_id"] = data.get('id')
-            result_dict["client_secret"] = data.get('client_secret')
-            print(f"[PAYMENT INTENT] {data.get('id')} - Status: {data.get('status')}")
-        
-        # Check for errors
-        error = data.get('error') or data.get('payment_intent', {}).get('last_payment_error')
-        if error:
-            decline_code = error.get('decline_code') or error.get('code') or "unknown"
-            error_message = error.get('message') or "Transaction error"
-            result_dict["error"] = error_message
-            result_dict["decline_code"] = decline_code
-            result_dict["success"] = False
-            print(f"[ERROR] {decline_code}: {error_message}")
-        
-        # Check for 3DS
-        if data.get('status') == 'requires_action' or data.get('next_action'):
-            result_dict["requires_3ds"] = True
-            print("[3DS] Required")
-
-# ============================================================================
-# BROWSERSTACK CONNECTION
-# ============================================================================
-
-async def get_browserstack_browser(playwright):
-    """
-    Connect to BrowserStack using official CDP connection
-    """
-    print("[BROWSERSTACK] Initializing connection...")
-    
-    # Get Playwright version
-    playwright_version = "1.40.0"  # Fallback version
-    try:
-        import playwright
-        playwright_version = playwright.__version__
-    except:
-        pass
-    
-    # BrowserStack capabilities
-    capabilities = {
-        # Browser configuration
-        'browser': 'chrome',
-        'browser_version': 'latest',
-        'os': 'Windows',
-        'os_version': '10',
-        
-        # Session info
-        'name': f'Stripe-{datetime.now().strftime("%H%M%S")}',
-        'build': f'stripe-automation-{datetime.now().strftime("%Y%m%d")}',
-        'project': 'Stripe Payment Automation',
-        
-        # BrowserStack credentials
-        'browserstack.username': CONFIG['BROWSERSTACK_USERNAME'],
-        'browserstack.accessKey': CONFIG['BROWSERSTACK_ACCESS_KEY'],
-        
-        # BrowserStack options
-        'browserstack.local': 'false',
-        'browserstack.networkLogs': 'true',
-        'browserstack.console': 'verbose',
-        'browserstack.debug': 'true',
-        'browserstack.video': 'false',  # Disable video to save resources
-        'browserstack.seleniumLogs': 'false',
-        'browserstack.idleTimeout': '300',
-        
-        # Playwright version
-        'client.playwrightVersion': playwright_version,
-    }
-    
-    # Create CDP URL with encoded capabilities
-    caps_json = json.dumps(capabilities)
-    caps_encoded = quote(caps_json)
-    cdp_url = f"wss://cdp.browserstack.com/playwright?caps={caps_encoded}"
-    
-    print(f"[BROWSERSTACK] Build: {capabilities['build']}")
-    print(f"[BROWSERSTACK] Session: {capabilities['name']}")
-    print(f"[BROWSERSTACK] Connecting...")
-    
-    try:
-        browser = await playwright.chromium.connect(
-            cdp_url,
-            timeout=30000  # 30 second connection timeout
-        )
-        print("[BROWSERSTACK] ✓ Connected successfully")
-        return browser
     except Exception as e:
-        print(f"[BROWSERSTACK] ✗ Connection failed: {str(e)}")
-        raise
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-async def safe_wait(page, ms):
-    """Safely wait without throwing errors"""
-    try:
-        await page.wait_for_timeout(ms)
-        return True
-    except:
-        return False
-
-# ============================================================================
-# MAIN AUTOMATION FUNCTION
-# ============================================================================
-
-async def run_stripe_automation(url, cc_string, email=None):
-    """
-    Main automation function to test Stripe payment
-    """
-    card = process_card_input(cc_string)
-    if not card:
-        return {"error": "Invalid card format. Expected: number|month|year|cvv"}
-    
-    email = email or f"test{random.randint(1000,9999)}@example.com"
-    random_name = generate_random_name()
-    
-    print(f"\n{'='*80}")
-    print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
-    print(f"[CARD] {card['number']} | {card['month']}/{card['year']} | {card['cvv']}")
-    print(f"[EMAIL] {email}")
-    print(f"[NAME] {random_name}")
-    print('='*80)
-    
-    stripe_result = {
-        "status": "pending",
-        "raw_responses": [],
-        "payment_confirmed": False,
-        "token_created": False,
-        "payment_method_created": False,
-        "payment_intent_created": False,
-        "success_url": None,
-        "requires_3ds": False
-    }
-    
-    analyzer = StripeResponseAnalyzer()
-    
-    async with async_playwright() as p:
-        browser = None
-        context = None
-        page = None
-        payment_submitted = False
-        
-        try:
-            # ============================================
-            # BROWSER CONNECTION (LOCAL OR BROWSERSTACK)
-            # ============================================
-            
-            if CONFIG["RUN_LOCAL"]:
-                print("[BROWSER] Launching local Chromium...")
-                browser = await p.chromium.launch(
-                    headless=False,
-                    slow_mo=100
-                )
-                print("[BROWSER] ✓ Local browser ready")
-            else:
-                browser = await get_browserstack_browser(p)
-            
-            # Create browser context
-            context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                locale='en-US',
-                timezone_id='America/New_York'
-            )
-            
-            page = await context.new_page()
-            
-            # ============================================
-            # RESPONSE CAPTURE
-            # ============================================
-            
-            async def capture_response(response):
-                """Capture and analyze Stripe API responses"""
-                try:
-                    if not analyzer.is_stripe_endpoint(response.url):
-                        return
-                    
-                    content_type = response.headers.get('content-type', '')
-                    if 'application/json' in content_type:
-                        try:
-                            body = await response.body()
-                            text = body.decode('utf-8', errors='ignore')
-                            analyzer.analyze_response(response.url, response.status, text, stripe_result)
-                        except Exception as e:
-                            print(f"[WARN] Failed to parse response: {e}")
-                except Exception as e:
-                    print(f"[WARN] Response capture error: {e}")
-            
-            page.on("response", capture_response)
-            
-            # ============================================
-            # NAVIGATION
-            # ============================================
-            
-            print(f"[NAV] Loading {url[:60]}...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=40000)
-            print("[NAV] ✓ Page loaded")
-            
-            await safe_wait(page, 3000)
-            
-            # ============================================
-            # FILL EMAIL
-            # ============================================
-            
-            print("[FILL] Email field...")
-            email_filled = False
-            try:
-                for selector in ['input[type="email"]', 'input[name="email"]', '#email', '[placeholder*="email" i]']:
-                    try:
-                        elements = await page.query_selector_all(selector)
-                        for element in elements:
-                            if await element.is_visible():
-                                await element.click()
-                                await element.fill(email)
-                                email_filled = True
-                                print(f"[EMAIL] ✓ {email}")
-                                break
-                        if email_filled:
-                            break
-                    except:
-                        continue
-            except Exception as e:
-                print(f"[EMAIL] ⚠ Could not fill: {e}")
-            
-            await safe_wait(page, 1000)
-            
-            # ============================================
-            # FILL CARD DETAILS IN STRIPE IFRAMES
-            # ============================================
-            
-            print("[FILL] Card details in Stripe iframes...")
-            filled_status = {"card": False, "expiry": False, "cvc": False}
-            
-            frames = page.frames
-            stripe_frames = [f for f in frames if 'stripe' in f.url.lower()]
-            print(f"[FRAMES] Found {len(stripe_frames)} Stripe frames")
-            
-            for frame in stripe_frames:
-                try:
-                    # Card number
-                    if not filled_status["card"]:
-                        for inp in await frame.query_selector_all('input'):
-                            try:
-                                ph = (await inp.get_attribute('placeholder') or '').lower()
-                                name = (await inp.get_attribute('name') or '').lower()
-                                if 'card number' in ph or '1234' in ph or 'cardnumber' in name:
-                                    await inp.click()
-                                    await inp.fill('')  # Clear first
-                                    for digit in card['number']:
-                                        await inp.type(digit, delay=random.randint(50, 100))
-                                    filled_status["card"] = True
-                                    print(f"[CARD] ✓ {card['number']}")
-                                    break
-                            except:
-                                continue
-                    
-                    # Expiry
-                    if not filled_status["expiry"]:
-                        for inp in await frame.query_selector_all('input'):
-                            try:
-                                ph = (await inp.get_attribute('placeholder') or '').lower()
-                                name = (await inp.get_attribute('name') or '').lower()
-                                if 'mm' in ph or 'expir' in ph or 'exp' in name:
-                                    await inp.click()
-                                    await inp.fill('')
-                                    exp_string = f"{card['month']}{card['year'][-2:]}"
-                                    for char in exp_string:
-                                        await inp.type(char, delay=random.randint(50, 100))
-                                    filled_status["expiry"] = True
-                                    print(f"[EXPIRY] ✓ {card['month']}/{card['year'][-2:]}")
-                                    break
-                            except:
-                                continue
-                    
-                    # CVC
-                    if not filled_status["cvc"]:
-                        for inp in await frame.query_selector_all('input'):
-                            try:
-                                ph = (await inp.get_attribute('placeholder') or '').lower()
-                                name = (await inp.get_attribute('name') or '').lower()
-                                if 'cvc' in ph or 'cvv' in ph or 'security' in ph or 'cvc' in name:
-                                    await inp.click()
-                                    await inp.fill('')
-                                    for digit in card['cvv']:
-                                        await inp.type(digit, delay=random.randint(50, 100))
-                                    filled_status["cvc"] = True
-                                    print(f"[CVC] ✓ {card['cvv']}")
-                                    break
-                            except:
-                                continue
-                except Exception as e:
-                    print(f"[WARN] Frame processing error: {e}")
-                    continue
-            
-            print(f"[FILL STATUS] Card: {filled_status['card']}, Expiry: {filled_status['expiry']}, CVC: {filled_status['cvc']}")
-            
-            # ============================================
-            # SUBMIT PAYMENT
-            # ============================================
-            
-            await safe_wait(page, 2000)
-            
-            print("[SUBMIT] Looking for submit button...")
-            try:
-                submit_selectors = [
-                    'button[type="submit"]',
-                    'button.SubmitButton',
-                    'button:has-text("Pay")',
-                    'button:has-text("Submit")',
-                    'button:has-text("Donate")',
-                    '[role="button"][type="submit"]'
-                ]
-                
-                for selector in submit_selectors:
-                    try:
-                        btn = page.locator(selector).first
-                        if await btn.count() > 0 and await btn.is_visible():
-                            await btn.click()
-                            payment_submitted = True
-                            print("[SUBMIT] ✓ Button clicked")
-                            break
-                    except:
-                        continue
-                
-                if not payment_submitted:
-                    await page.keyboard.press('Enter')
-                    payment_submitted = True
-                    print("[SUBMIT] ✓ Enter pressed")
-            except Exception as e:
-                print(f"[SUBMIT] ⚠ Failed: {e}")
-            
-            # ============================================
-            # WAIT FOR PAYMENT PROCESSING
-            # ============================================
-            
-            print("[WAIT] Processing payment (10s initial wait)...")
-            await safe_wait(page, 10000)
-            
-            # ============================================
-            # MONITOR FOR CONFIRMATION
-            # ============================================
-            
-            print("[MONITOR] Waiting for payment confirmation...")
-            start_time = time.time()
-            max_wait = CONFIG["RESPONSE_TIMEOUT_SECONDS"]
-            last_response_count = 0
-            
-            while time.time() - start_time < max_wait:
-                elapsed = time.time() - start_time
-                
-                # Check for new responses
-                current_responses = len(stripe_result['raw_responses'])
-                if current_responses > last_response_count:
-                    print(f"[MONITOR] {current_responses} Stripe responses captured")
-                    last_response_count = current_responses
-                
-                # Check for payment confirmation
-                if stripe_result.get("payment_confirmed"):
-                    print("[✓✓✓ SUCCESS] Payment confirmed!")
-                    break
-                
-                # Check for error
-                if stripe_result.get("error"):
-                    print(f"[ERROR] {stripe_result['error']}")
-                    break
-                
-                # Check for 3DS
-                if stripe_result.get("requires_3ds"):
-                    print("[3DS] Authentication required - stopping")
-                    break
-                
-                # Check URL for success redirect
-                try:
-                    current_url = page.url
-                    success_url = stripe_result.get("success_url")
-                    
-                    if success_url and current_url.startswith(success_url):
-                        print(f"[✓ SUCCESS] Redirected to: {current_url[:80]}")
-                        stripe_result["payment_confirmed"] = True
-                        stripe_result["success"] = True
-                        stripe_result["message"] = "Payment successful (redirect)"
-                        break
-                    
-                    if any(keyword in current_url.lower() for keyword in ['success', 'thank-you', 'complete', 'confirmed']):
-                        print(f"[SUCCESS PAGE] {current_url[:80]}")
-                        stripe_result["payment_confirmed"] = True
-                        stripe_result["success"] = True
-                        stripe_result["message"] = "Payment successful (success page)"
-                        break
-                except:
-                    pass
-                
-                # Heartbeat check
-                if int(elapsed) % 5 == 0 and int(elapsed) > 0:
-                    try:
-                        await page.evaluate('1')
-                    except:
-                        print("[WARNING] Browser connection lost")
-                        break
-                
-                await asyncio.sleep(0.5)
-            
-            print(f"\n[SUMMARY] Captured {len(stripe_result['raw_responses'])} Stripe API responses")
-            
-            # ============================================
-            # BUILD FINAL RESPONSE
-            # ============================================
-            
-            if stripe_result.get("payment_confirmed"):
-                return {
-                    "success": True,
-                    "message": stripe_result.get("message", "Payment successful"),
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "email": email,
-                    "payment_intent_id": stripe_result.get("payment_intent_id"),
-                    "token_id": stripe_result.get("token_id"),
-                    "payment_method_id": stripe_result.get("payment_method_id"),
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-            elif stripe_result.get("requires_3ds"):
-                return {
-                    "success": False,
-                    "requires_3ds": True,
-                    "message": "3D Secure authentication required",
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "email": email,
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-            elif stripe_result.get("error"):
-                return {
-                    "success": False,
-                    "error": stripe_result["error"],
-                    "decline_code": stripe_result.get("decline_code"),
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "email": email,
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": "Payment status unclear - check raw responses",
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "email": email,
-                    "details": {
-                        "filled": filled_status,
-                        "payment_submitted": payment_submitted,
-                        "responses_captured": len(stripe_result["raw_responses"])
-                    },
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-                
-        except Exception as e:
-            error_msg = str(e)
-            print(f"[ERROR] Automation failed: {error_msg}")
-            return {
-                "error": f"Automation failed: {error_msg}",
-                "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                "email": email,
-                "raw_responses": stripe_result.get("raw_responses", [])
-            }
-            
-        finally:
-            # ============================================
-            # CLEANUP
-            # ============================================
-            print("[CLEANUP] Closing browser resources...")
-            if page:
-                try:
-                    await page.close()
-                except:
-                    pass
-            if context:
-                try:
-                    await context.close()
-                except:
-                    pass
-            if browser:
-                try:
-                    await browser.close()
-                    print("[CLEANUP] ✓ Browser closed")
-                except:
-                    pass
-
-# ============================================================================
-# FLASK ENDPOINTS
-# ============================================================================
-
-@app.route('/hrkXstripe', methods=['GET'])
-def stripe_endpoint():
-    """
-    Main endpoint for Stripe automation
-    
-    Query params:
-        - url: Stripe payment page URL (required)
-        - cc: Card details in format number|month|year|cvv (required)
-        - email: Email address (optional)
-    
-    Example:
-        /hrkXstripe?url=https://donate.example.com&cc=4242424242424242|12|2025|123&email=test@example.com
-    """
-    # Rate limiting
-    can_proceed, wait_time = rate_limit_check()
-    if not can_proceed:
         return jsonify({
-            "error": "Rate limit exceeded",
-            "retry_after": f"{wait_time:.1f}s"
-        }), 429
-    
-    # Get parameters
-    url = request.args.get('url')
-    cc = request.args.get('cc')
-    email = request.args.get('email')
-    
-    print(f"\n{'='*80}")
-    print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[URL] {url}")
-    print(f"[CC] {cc}")
-    print(f"[EMAIL] {email or 'auto-generated'}")
-    print('='*80)
-    
-    # Validation
-    if not url or not cc:
-        return jsonify({
-            "error": "Missing required parameters",
-            "required": {
-                "url": "Stripe payment page URL",
-                "cc": "Card details (format: number|month|year|cvv)"
-            },
-            "optional": {
-                "email": "Email address"
-            }
-        }), 400
-    
-    # Run automation
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    try:
-        result = loop.run_until_complete(run_stripe_automation(url, cc, email))
-        
-        success = result.get('success', False)
-        status_code = 200 if success else 400
-        
-        print(f"[RESULT] {'✓ SUCCESS' if success else '✗ FAILED'}")
-        
-        return jsonify(result), status_code
-        
-    except Exception as e:
-        print(f"[SERVER ERROR] {e}")
-        return jsonify({
-            "error": f"Server error: {str(e)}"
+            'success': False,
+            'error': str(e)
         }), 500
-        
-    finally:
-        try:
-            loop.close()
-        except:
-            pass
 
-@app.route('/status', methods=['GET'])
-def status_endpoint():
-    """Health check endpoint"""
-    return jsonify({
-        "status": "online",
-        "version": "3.0-browserstack",
-        "timestamp": datetime.now().isoformat(),
-        "config": {
-            "run_local": CONFIG["RUN_LOCAL"],
-            "browserstack_configured": bool(CONFIG["BROWSERSTACK_USERNAME"] and CONFIG["BROWSERSTACK_ACCESS_KEY"]),
-            "rate_limit": f"{CONFIG['RATE_LIMIT_REQUESTS']} requests per {CONFIG['RATE_LIMIT_WINDOW']}s"
-        }
-    })
-
-@app.route('/test', methods=['GET'])
-def test_endpoint():
-    """
-    Test BrowserStack connection
-    """
-    if CONFIG["RUN_LOCAL"]:
-        return jsonify({
-            "error": "Test endpoint only works with BrowserStack. Set RUN_LOCAL=false"
-        }), 400
-    
-    async def test_connection():
-        async with async_playwright() as p:
-            try:
-                browser = await get_browserstack_browser(p)
-                page = await browser.new_page()
-                await page.goto('https://www.google.com', timeout=15000)
-                title = await page.title()
-                await browser.close()
-                return {
-                    "success": True,
-                    "message": "BrowserStack connection successful",
-                    "test_page_title": title
-                }
-            except Exception as e:
-                return {
-                    "success": False,
-                    "error": str(e)
-                }
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
+@app.route('/api/export', methods=['POST'])
+def export_results():
+    """Export results as CSV"""
     try:
-        result = loop.run_until_complete(test_connection())
-        status_code = 200 if result.get('success') else 500
-        return jsonify(result), status_code
-    finally:
-        loop.close()
-
-@app.route('/', methods=['GET'])
-def index():
-    """API documentation"""
-    return jsonify({
-        "name": "Stripe Payment Automation API",
-        "version": "3.0-browserstack",
-        "endpoints": {
-            "/hrkXstripe": {
-                "method": "GET",
-                "description": "Automate Stripe payment testing",
-                "params": {
-                    "url": "Payment page URL (required)",
-                    "cc": "Card format: number|month|year|cvv (required)",
-                    "email": "Email address (optional)"
-                },
-                "example": "/hrkXstripe?url=https://donate.example.com&cc=4242424242424242|12|2025|123"
-            },
-            "/status": {
-                "method": "GET",
-                "description": "Health check and configuration status"
-            },
-            "/test": {
-                "method": "GET",
-                "description": "Test BrowserStack connection"
-            }
-        },
-        "card_format": {
-            "example": "4242424242424242|12|2025|123",
-            "placeholders": "Use 'x' for random: 424242xxxxxx4242|xx|xxxx|xxx"
-        }
-    })
+        results = request.json.get('results', [])
+        
+        csv_content = "Card Number,Brand,Status,Amount,Currency,Message,Transaction ID,Timestamp\n"
+        for r in results:
+            csv_content += f'"{r.get("full_card", "")}","{r.get("brand", "")}","{r.get("status", "")}","{r.get("amount", "")}","{r.get("currency", "")}","{r.get("message", "")}","{r.get("transaction_id", "")}","{r.get("timestamp", "")}"\n'
+        
+        # Create temporary file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            f.write(csv_content)
+            temp_path = f.name
+        
+        return send_file(temp_path, as_attachment=True, download_name=f'payment_test_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ============================================================================
-# MAIN
+# HTML TEMPLATE
+# ============================================================================
+
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Gateway Tester - Professional Edition</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #8b5cf6;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --dark: #1e293b;
+            --darker: #0f172a;
+            --light: #f8fafc;
+            --gray: #64748b;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            min-height: 100vh;
+            color: #fff;
+            position: relative;
+            overflow-x: hidden;
+        }
+        
+        /* Animated Background Pattern */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                radial-gradient(circle at 20% 80%, rgba(99, 102, 241, 0.1) 0%, transparent 50%),
+                radial-gradient(circle at 80% 20%, rgba(139, 92, 246, 0.1) 0%, transparent 50%),
+                radial-gradient(circle at 40% 40%, rgba(236, 72, 153, 0.1) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 1;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+            position: relative;
+            z-index: 2;
+        }
+        
+        /* Header */
+        .header {
+            text-align: center;
+            margin-bottom: 3rem;
+            animation: fadeInDown 0.8s ease;
+        }
+        
+        .logo {
+            display: inline-block;
+            padding: 1rem 2rem;
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 100px;
+            margin-bottom: 1rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .logo h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff, #e0e7ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .subtitle {
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 1.1rem;
+        }
+        
+        /* Main Grid */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+        
+        @media (max-width: 968px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* Cards */
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 2rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            animation: fadeInUp 0.8s ease;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+        }
+        
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .card-icon {
+            width: 48px;
+            height: 48px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+        }
+        
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+        
+        /* Business Type Selector */
+        .business-tabs {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .business-tab {
+            flex: 1;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 2px solid transparent;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-align: center;
+        }
+        
+        .business-tab:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .business-tab.active {
+            background: rgba(99, 102, 241, 0.2);
+            border-color: var(--primary);
+        }
+        
+        .business-tab-icon {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+        
+        .business-tab-title {
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+        
+        .business-tab-amount {
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 0.9rem;
+        }
+        
+        /* Form Elements */
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        
+        .form-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+        
+        .form-textarea {
+            width: 100%;
+            min-height: 200px;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            color: #fff;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 0.9rem;
+            resize: vertical;
+            transition: all 0.3s ease;
+        }
+        
+        .form-textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: rgba(255, 255, 255, 0.08);
+        }
+        
+        .form-textarea::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+        
+        /* Buttons */
+        .btn-group {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 0.875rem 1.75rem;
+            border: none;
+            border-radius: 10px;
+            font-weight: 600;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(99, 102, 241, 0.3);
+        }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        /* Statistics */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .stat-card {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 1rem;
+            border-radius: 12px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        
+        .stat-label {
+            font-size: 0.875rem;
+            color: rgba(255, 255, 255, 0.7);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        /* Results */
+        .results-container {
+            max-height: 500px;
+            overflow-y: auto;
+            padding-right: 0.5rem;
+        }
+        
+        .results-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .results-container::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+        }
+        
+        .results-container::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+        }
+        
+        .result-item {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid transparent;
+            animation: slideInRight 0.5s ease;
+            transition: all 0.3s ease;
+        }
+        
+        .result-item:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        
+        .result-item.success {
+            border-left-color: var(--success);
+        }
+        
+        .result-item.failed {
+            border-left-color: var(--danger);
+        }
+        
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+        
+        .result-card-info {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        
+        .card-brand {
+            padding: 0.25rem 0.75rem;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .result-status {
+            padding: 0.25rem 0.75rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+        
+        .status-approved {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+        }
+        
+        .status-declined, .status-invalid, .status-fraud, .status-error {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+        
+        .result-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: rgba(255, 255, 255, 0.8);
+        }
+        
+        .result-detail {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .result-detail-label {
+            font-weight: 600;
+            color: rgba(255, 255, 255, 0.6);
+        }
+        
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: rgba(255, 255, 255, 0.6);
+        }
+        
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+        
+        /* Loading State */
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 2rem;
+        }
+        
+        .loading.active {
+            display: block;
+        }
+        
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1rem;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Animations */
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        @keyframes slideInRight {
+            from {
+                opacity: 0;
+                transform: translateX(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+        
+        /* Notification */
+        .notification {
+            position: fixed;
+            top: 2rem;
+            right: -400px;
+            background: rgba(255, 255, 255, 0.95);
+            color: #333;
+            padding: 1rem 1.5rem;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            transition: right 0.3s ease;
+            z-index: 1000;
+            max-width: 350px;
+        }
+        
+        .notification.show {
+            right: 2rem;
+        }
+        
+        .notification-icon {
+            font-size: 1.5rem;
+        }
+        
+        .notification.success .notification-icon {
+            color: var(--success);
+        }
+        
+        .notification.error .notification-icon {
+            color: var(--danger);
+        }
+        
+        .notification-message {
+            flex: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <h1>💳 Payment Gateway Tester</h1>
+            </div>
+            <p class="subtitle">Professional Card Testing & Validation Platform</p>
+        </div>
+        
+        <!-- Main Grid -->
+        <div class="main-grid">
+            <!-- Left Panel - Input -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">⚡</div>
+                    <h2 class="card-title">Test Configuration</h2>
+                </div>
+                
+                <!-- Business Type Selector -->
+                <div class="business-tabs">
+                    <div class="business-tab active" onclick="selectBusiness('swiggy', this)">
+                        <div class="business-tab-icon">🍕</div>
+                        <div class="business-tab-title">Food Delivery</div>
+                        <div class="business-tab-amount">₹141.00 per transaction</div>
+                    </div>
+                    <div class="business-tab" onclick="selectBusiness('instamart', this)">
+                        <div class="business-tab-icon">🛒</div>
+                        <div class="business-tab-title">Quick Commerce</div>
+                        <div class="business-tab-amount">₹726.00 per transaction</div>
+                    </div>
+                </div>
+                
+                <!-- Card Input -->
+                <div class="form-group">
+                    <label class="form-label">Test Cards (one per line)</label>
+                    <textarea 
+                        id="cardInput" 
+                        class="form-textarea" 
+                        placeholder="Enter cards in any format:
+4111111111111111|12|25|123
+5555555555554444/06/24/456
+378282246310005-11-25-1234
+6011111111111117 09 25 789"
+                    ></textarea>
+                </div>
+                
+                <!-- Buttons -->
+                <div class="btn-group">
+                    <button class="btn btn-primary" onclick="processCards()" id="processBtn">
+                        <span>🚀</span>
+                        Process Cards
+                    </button>
+                    <button class="btn btn-secondary" onclick="clearInput()">
+                        <span>🗑️</span>
+                        Clear
+                    </button>
+                    <button class="btn btn-secondary" onclick="loadSampleCards()">
+                        <span>📋</span>
+                        Sample
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Right Panel - Results -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📊</div>
+                    <h2 class="card-title">Test Results</h2>
+                </div>
+                
+                <!-- Statistics -->
+                <div class="stats-grid" id="statsGrid" style="display: none;">
+                    <div class="stat-card">
+                        <div class="stat-value" id="statTotal">0</div>
+                        <div class="stat-label">Total</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" style="color: #10b981;" id="statSuccess">0</div>
+                        <div class="stat-label">Success</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" style="color: #ef4444;" id="statFailed">0</div>
+                        <div class="stat-label">Failed</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="statRate">0%</div>
+                        <div class="stat-label">Rate</div>
+                    </div>
+                </div>
+                
+                <!-- Loading State -->
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p>Processing cards...</p>
+                </div>
+                
+                <!-- Results List -->
+                <div class="results-container" id="resultsContainer">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📦</div>
+                        <h3>No Results Yet</h3>
+                        <p>Process some cards to see results here</p>
+                    </div>
+                </div>
+                
+                <!-- Export Button -->
+                <div class="btn-group" id="exportGroup" style="display: none; margin-top: 1rem;">
+                    <button class="btn btn-secondary" onclick="exportResults()">
+                        <span>📥</span>
+                        Export CSV
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Notification -->
+    <div class="notification" id="notification">
+        <div class="notification-icon" id="notificationIcon">✓</div>
+        <div class="notification-message" id="notificationMessage">Success!</div>
+    </div>
+    
+    <script>
+        // Global Variables
+        let selectedBusinessType = 'swiggy';
+        let currentResults = [];
+        
+        // Business Type Selection
+        function selectBusiness(type, element) {
+            selectedBusinessType = type;
+            document.querySelectorAll('.business-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            element.classList.add('active');
+        }
+        
+        // Process Cards
+        async function processCards() {
+            const cardInput = document.getElementById('cardInput');
+            const cards = cardInput.value.trim();
+            
+            if (!cards) {
+                showNotification('Please enter at least one card', 'error');
+                return;
+            }
+            
+            // Show loading
+            document.getElementById('loading').classList.add('active');
+            document.getElementById('processBtn').disabled = true;
+            document.getElementById('resultsContainer').innerHTML = '';
+            
+            try {
+                const response = await fetch('/api/process', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        cards: cards,
+                        businessType: selectedBusinessType
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    currentResults = data.results;
+                    displayResults(data.results);
+                    displayStatistics(data.statistics);
+                    showNotification(`Processed ${data.results.length} cards successfully`, 'success');
+                    
+                    // Show invalid lines if any
+                    if (data.statistics.invalid_lines && data.statistics.invalid_lines.length > 0) {
+                        console.warn('Invalid card lines:', data.statistics.invalid_lines);
+                    }
+                } else {
+                    showNotification(data.error || 'Processing failed', 'error');
+                }
+            } catch (error) {
+                showNotification('Error: ' + error.message, 'error');
+            } finally {
+                document.getElementById('loading').classList.remove('active');
+                document.getElementById('processBtn').disabled = false;
+            }
+        }
+        
+        // Display Results
+        function displayResults(results) {
+            const container = document.getElementById('resultsContainer');
+            container.innerHTML = '';
+            
+            results.forEach((result, index) => {
+                const isSuccess = result.success;
+                const statusClass = result.status.toLowerCase();
+                
+                const resultHtml = `
+                    <div class="result-item ${isSuccess ? 'success' : 'failed'}" style="animation-delay: ${index * 0.05}s">
+                        <div class="result-header">
+                            <div class="result-card-info">
+                                <span class="card-brand">${result.brand.toUpperCase()}</span>
+                                <span>${result.card}</span>
+                            </div>
+                            <span class="result-status status-${statusClass}">${result.status}</span>
+                        </div>
+                        <div class="result-details">
+                            <div class="result-detail">
+                                <span class="result-detail-label">Amount:</span>
+                                <span>₹${result.amount}</span>
+                            </div>
+                            <div class="result-detail">
+                                <span class="result-detail-label">Transaction:</span>
+                                <span>${result.transaction_id}</span>
+                            </div>
+                            <div class="result-detail">
+                                <span class="result-detail-label">Message:</span>
+                                <span>${result.message}</span>
+                            </div>
+                            ${result.auth_code ? `
+                            <div class="result-detail">
+                                <span class="result-detail-label">Auth Code:</span>
+                                <span>${result.auth_code}</span>
+                            </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+                
+                container.insertAdjacentHTML('beforeend', resultHtml);
+            });
+            
+            document.getElementById('exportGroup').style.display = 'flex';
+        }
+        
+        // Display Statistics
+        function displayStatistics(stats) {
+            document.getElementById('statsGrid').style.display = 'grid';
+            document.getElementById('statTotal').textContent = stats.total;
+            document.getElementById('statSuccess').textContent = stats.successful;
+            document.getElementById('statFailed').textContent = stats.failed;
+            document.getElementById('statRate').textContent = stats.success_rate + '%';
+        }
+        
+        // Clear Input
+        function clearInput() {
+            document.getElementById('cardInput').value = '';
+            showNotification('Input cleared', 'success');
+        }
+        
+        // Load Sample Cards
+        function loadSampleCards() {
+            const samples = [
+                '4111111111111111|12|25|123',
+                '5555555555554444|06|24|456',
+                '378282246310005|11|25|1234',
+                '6011111111111117|09|25|789',
+                '3530111333300000|07|25|456',
+                '4000056655665556|10|25|999',
+                '5200828282828210|04|25|123',
+                '371449635398431|12|24|9999'
+            ];
+            
+            document.getElementById('cardInput').value = samples.join('\\n');
+            showNotification('Sample cards loaded', 'success');
+        }
+        
+        // Export Results
+        async function exportResults() {
+            if (!currentResults || currentResults.length === 0) {
+                showNotification('No results to export', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/export', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        results: currentResults
+                    })
+                });
+                
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `payment_results_${Date.now()}.csv`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    window.URL.revokeObjectURL(url);
+                    
+                    showNotification('Results exported successfully', 'success');
+                } else {
+                    throw new Error('Export failed');
+                }
+            } catch (error) {
+                showNotification('Failed to export results', 'error');
+            }
+        }
+        
+        // Show Notification
+        function showNotification(message, type = 'success') {
+            const notification = document.getElementById('notification');
+            const icon = document.getElementById('notificationIcon');
+            const messageEl = document.getElementById('notificationMessage');
+            
+            notification.className = 'notification ' + type;
+            icon.textContent = type === 'success' ? '✓' : '✗';
+            messageEl.textContent = message;
+            
+            notification.classList.add('show');
+            
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 4000);
+        }
+        
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            // Load sample cards on start
+            loadSampleCards();
+        });
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.ctrlKey || e.metaKey) {
+                if (e.key === 'Enter') {
+                    processCards();
+                } else if (e.key === 'l') {
+                    e.preventDefault();
+                    loadSampleCards();
+                } else if (e.key === 'k') {
+                    e.preventDefault();
+                    clearInput();
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+'''
+
+# ============================================================================
+# AUTO-LAUNCH BROWSER
+# ============================================================================
+
+def open_browser():
+    """Open browser after server starts"""
+    time.sleep(1.5)  # Wait for server to start
+    webbrowser.open('http://localhost:5000')
+
+# ============================================================================
+# MAIN EXECUTION
 # ============================================================================
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
+    print("\n" + "="*60)
+    print("💳 PAYMENT GATEWAY TESTER - PROFESSIONAL EDITION")
+    print("="*60)
+    print("\n📌 Starting server...")
+    print("🌐 Open your browser at: http://localhost:5000")
+    print("⌨️  Press Ctrl+C to stop the server\n")
+    print("Keyboard Shortcuts:")
+    print("  • Ctrl+Enter : Process cards")
+    print("  • Ctrl+L     : Load sample cards") 
+    print("  • Ctrl+K     : Clear input\n")
+    print("="*60 + "\n")
     
-    print("="*80)
-    print("🚀 Stripe Payment Automation API v3.0 - BrowserStack Edition")
-    print("="*80)
-    print(f"[PORT] {port}")
-    print(f"[MODE] {'LOCAL BROWSER' if CONFIG['RUN_LOCAL'] else 'BROWSERSTACK'}")
+    # Open browser in a separate thread
+    browser_thread = threading.Thread(target=open_browser)
+    browser_thread.daemon = True
+    browser_thread.start()
     
-    if not CONFIG["RUN_LOCAL"]:
-        if CONFIG["BROWSERSTACK_USERNAME"] and CONFIG["BROWSERSTACK_ACCESS_KEY"]:
-            print(f"[BROWSERSTACK] ✓ Credentials configured")
-            print(f"[USERNAME] {CONFIG['BROWSERSTACK_USERNAME']}")
-        else:
-            print("[WARNING] ⚠ BrowserStack credentials not set!")
-            print("[WARNING] Set BROWSERSTACK_USERNAME and BROWSERSTACK_ACCESS_KEY")
-    
-    print("="*80)
-    print("\n📖 Endpoints:")
-    print(f"  - GET  http://localhost:{port}/")
-    print(f"  - GET  http://localhost:{port}/status")
-    print(f"  - GET  http://localhost:{port}/test")
-    print(f"  - GET  http://localhost:{port}/hrkXstripe?url=...&cc=...")
-    print("\n" + "="*80 + "\n")
-    
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Run Flask app
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False)
+    except KeyboardInterrupt:
+        print("\n\n✨ Server stopped successfully. Goodbye!")
+        sys.exit(0)
