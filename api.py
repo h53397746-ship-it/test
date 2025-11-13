@@ -22,7 +22,7 @@ except Exception:
 # -------------------------
 # CONFIG - Edit before running or set environment variables
 # -------------------------
-API_TOKEN = os.getenv("BOT_TOKEN", "") or "7640402813:AAHoVCdmhnL_bU3t8Fdpg_wnI7zJ0POS5Kc"
+API_TOKEN = os.getenv("BOT_TOKEN", "") or "7640402813:AAErhkQXssg77_udzFZI6eR_Y_wz_rV-0eo"
 OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "7280294090").split(",")]  # comma-separated
 POSTGRES_URI = os.getenv("POSTGRES_URI", "postgres://uleukjqm3i83c:p5d12f950cad1d479bc5125e29464914f8014e5fbb405a8a4ddb99443909777af@ec2-75-101-195-77.compute-1.amazonaws.com:5432/dfll8m5tt2k020") or None  # set to None to disable Postgres lookups
 DATA_STORE_PATH = os.getenv("DATA_STORE_PATH", "data_store.json")
