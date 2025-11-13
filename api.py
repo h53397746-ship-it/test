@@ -1,713 +1,679 @@
-#!/usr/bin/env python3
 import os
-import asyncio
-import json
-import random
 import re
+import json
 import time
+import random
+import string
+import shutil
+import logging
+import threading
 from datetime import datetime
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-from collections import deque
+from typing import Optional, List, Dict, Any
 
-load_dotenv()
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-CONFIG = {
-    "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
-    "BRIGHTDATA_AUTH": os.getenv('BRIGHTDATA_AUTH', 'brd-customer-hl_9e99ef01-zone-scraping_browser1:b8nk1xz9a83f'),
-    "RESPONSE_TIMEOUT_SECONDS": 50,
-    "RETRY_DELAY": 2000,
-    "RATE_LIMIT_REQUESTS": 5,
-    "RATE_LIMIT_WINDOW": 60,
-    "MAX_RETRIES": 2,
-    "BROWSER_TIMEOUT": 120000,
-    "CAPTCHA_DETECT_TIMEOUT": 10000,
-    "CAPTCHA_SOLVE_TIMEOUT": 30000
+# Optional Postgres
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
+
+# -------------------------
+# CONFIG - Edit before running or set environment variables
+# -------------------------
+API_TOKEN = os.getenv("BOT_TOKEN", "") or "7640402813:AAHoVCdmhnL_bU3t8Fdpg_wnI7zJ0POS5Kc"
+OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "7280294090").split(",")]  # comma-separated
+POSTGRES_URI = os.getenv("POSTGRES_URI", "postgres://uleukjqm3i83c:p5d12f950cad1d479bc5125e29464914f8014e5fbb405a8a4ddb99443909777af@ec2-75-101-195-77.compute-1.amazonaws.com:5432/dfll8m5tt2k020") or None  # set to None to disable Postgres lookups
+DATA_STORE_PATH = os.getenv("DATA_STORE_PATH", "data_store.json")
+BACKUP_PATH = DATA_STORE_PATH + ".bak"
+SUPPORT_BOT = os.getenv("SUPPORT_BOT", "@CineSyncBot.")
+DATA_EXPIRY_MINUTES = int(os.getenv("DATA_EXPIRY_MINUTES", "10"))
+DEFAULT_CREDITS = int(os.getenv("DEFAULT_CREDITS", "2"))
+
+# UI / branding
+BOT_NAME = os.getenv("BOT_NAME", "OSINT Pro")
+COMPANY_LINE = os.getenv("COMPANY_LINE", "Reliable, fast OSINT lookups")
+PRIVACY_NOTE = "Your searches are stored locally for your convenience. Remove data with /clearhistory."
+
+PRICING_PLANS = {
+    "basic": {"credits": 10, "price": 50, "description": "10 searches"},
+    "standard": {"credits": 25, "price": 100, "description": "25 searches"},
+    "premium": {"credits": 50, "price": 180, "description": "50 searches"},
+    "pro": {"credits": 100, "price": 300, "description": "100 searches"}
 }
 
-app = Flask(__name__)
-request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
+USER_DATA_FIELDS = ['mobile', 'name', 'fname', 'address', 'alt', 'circle', 'aadhar', 'email']
+# -------------------------
 
-def rate_limit_check():
-    now = time.time()
-    while request_timestamps and request_timestamps[0] < now - CONFIG["RATE_LIMIT_WINDOW"]:
-        request_timestamps.popleft()
-    
-    if len(request_timestamps) >= CONFIG["RATE_LIMIT_REQUESTS"]:
-        oldest = request_timestamps[0]
-        wait_time = CONFIG["RATE_LIMIT_WINDOW"] - (now - oldest)
-        return False, wait_time
-    
-    request_timestamps.append(now)
-    return True, 0
+# logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("combined_bot_json_refined")
 
-# Card utilities (keeping existing functions)
-def luhn_algorithm(number_str):
-    total = 0
-    reverse_digits = number_str[::-1]
-    for i, digit in enumerate(reverse_digits):
-        n = int(digit)
-        if (i % 2) == 1:
-            n *= 2
-            if n > 9:
-                n -= 9
-        total += n
-    return total % 10 == 0
+# telebot
+if not API_TOKEN or API_TOKEN == "REPLACE_WITH_YOUR_TOKEN":
+    logger.error("Missing bot token. Set API_TOKEN in the file or BOT_TOKEN env var.")
+    raise SystemExit("Missing bot token")
+bot = telebot.TeleBot(API_TOKEN, threaded=True)
 
-def complete_luhn(base):
-    for d in range(10):
-        candidate = base + str(d)
-        if luhn_algorithm(candidate):
-            return candidate
-    return None
+# -------------------------
+# Postgres wrapper (optional)
+# -------------------------
+class PostgresDB:
+    def __init__(self, uri: Optional[str]):
+        self.uri = uri
+        self.conn = None
+        if uri and psycopg2:
+            self.connect()
+        elif uri and not psycopg2:
+            logger.warning("psycopg2 not installed; Postgres disabled.")
+            self.uri = None
 
-def get_card_length(bin_str):
-    first_two = bin_str[:2] if len(bin_str) >= 2 else ""
-    return 15 if first_two in ['34', '37'] else 16
-
-def get_cvv_length(card_number):
-    return 4 if len(card_number) == 15 else 3
-
-def random_digit():
-    return str(random.randint(0, 9))
-
-def generate_card_from_pattern(pattern):
-    clean_pattern = re.sub(r'[^0-9x]', '', pattern, flags=re.IGNORECASE)
-    card_length = get_card_length(clean_pattern.replace('x', '0'))
-    
-    result = ''
-    for char in clean_pattern:
-        if len(result) >= card_length - 1:
-            break
-        result += random_digit() if char.lower() == 'x' else char
-    
-    while len(result) < card_length - 1:
-        result += random_digit()
-    
-    result = result[:card_length - 1]
-    return complete_luhn(result) or result + '0'
-
-def process_card_with_placeholders(number, month, year, cvv):
-    processed_number = generate_card_from_pattern(number) if 'x' in number.lower() else number
-    processed_month = str(random.randint(1, 12)).zfill(2) if 'x' in month.lower() else month.zfill(2)
-    
-    current_year = datetime.now().year
-    if 'x' in year.lower():
-        processed_year = str(random.randint(current_year + 1, current_year + 6))
-    elif len(year) == 2:
-        processed_year = '20' + year
-    else:
-        processed_year = year
-    
-    cvv_length = get_cvv_length(processed_number)
-    processed_cvv = ''.join([random_digit() for _ in range(cvv_length)]) if 'x' in cvv.lower() else cvv
-    
-    return {
-        "number": processed_number,
-        "month": processed_month,
-        "year": processed_year,
-        "cvv": processed_cvv
-    }
-
-def process_card_input(cc_string):
-    parts = cc_string.split('|')
-    if len(parts) != 4:
-        return None
-    return process_card_with_placeholders(*parts)
-
-def generate_random_name():
-    first_names = ['Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey', 'Riley', 'Avery', 'Quinn', 'Sage', 'Parker']
-    last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez']
-    return f"{random.choice(first_names)} {random.choice(last_names)}"
-
-# Enhanced Response Analyzer (keeping existing)
-class StripeResponseAnalyzer:
-    @staticmethod
-    def is_stripe_endpoint(url):
-        return any(domain in url.lower() for domain in ['stripe.com', 'stripe.network'])
-    
-    @staticmethod
-    def is_payment_critical_endpoint(url):
-        critical = [
-            '/v1/payment_intents',
-            '/v1/payment_pages',
-            '/v1/tokens',
-            '/v1/payment_methods',
-            '/confirm',
-            '/v1/charges'
-        ]
-        return any(endpoint in url.lower() for endpoint in critical)
-    
-    @staticmethod
-    def analyze_response(url, status, body_text, result_dict):
+    def connect(self):
         try:
-            data = json.loads(body_text)
-        except:
-            return
-        
-        result_dict["raw_responses"].append({
-            "url": url,
-            "status": status,
-            "data": data,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        if StripeResponseAnalyzer.is_payment_critical_endpoint(url):
-            print(f"[PAYMENT API] {url[:60]}... [{status}]")
-            print(f"[DATA] {json.dumps(data)[:300]}...")
-        
-        if data.get('success_url'):
-            result_dict["success_url"] = data['success_url']
-            print(f"[SUCCESS URL] {data['success_url']}")
-        
-        is_payment_success = (
-            data.get('status') in ['succeeded', 'success', 'requires_capture', 'processing', 'complete'] or
-            data.get('payment_intent', {}).get('status') in ['succeeded', 'success', 'requires_capture', 'processing'] or
-            data.get('payment_status') in ['paid', 'complete'] or
-            data.get('outcome', {}).get('type') == 'authorized' or
-            data.get('status') == 'complete' and 'payment_intent' in data or
-            data.get('paid') == True or
-            (data.get('object') == 'setup_intent' and data.get('status') == 'succeeded')
-        )
-        
-        if is_payment_success:
-            result_dict["payment_confirmed"] = True
-            result_dict["success"] = True
-            result_dict["message"] = f"Payment {data.get('status', 'succeeded')}"
-            result_dict["payment_intent_id"] = (
-                data.get('id') or 
-                data.get('payment_intent', {}).get('id') or
-                data.get('payment_intent')
-            )
-            print(f"[✓✓✓ PAYMENT CONFIRMED] {data.get('status')}")
-            return
-        
-        if status == 200 and data.get('id', '').startswith('tok_'):
-            result_dict["token_created"] = True
-            result_dict["token_id"] = data.get('id')
-            print(f"[TOKEN] {data.get('id')}")
-        
-        if status == 200 and data.get('id', '').startswith('pm_'):
-            result_dict["payment_method_created"] = True
-            result_dict["payment_method_id"] = data.get('id')
-            print(f"[PAYMENT METHOD] {data.get('id')}")
-        
-        if status == 200 and data.get('id', '').startswith('pi_'):
-            result_dict["payment_intent_created"] = True
-            result_dict["payment_intent_id"] = data.get('id')
-            result_dict["client_secret"] = data.get('client_secret')
-            print(f"[PAYMENT INTENT] {data.get('id')} - Status: {data.get('status')}")
-        
-        error = data.get('error') or data.get('payment_intent', {}).get('last_payment_error')
-        if error:
-            decline_code = error.get('decline_code') or error.get('code') or "unknown"
-            error_message = error.get('message') or "Transaction error"
-            result_dict["error"] = error_message
-            result_dict["decline_code"] = decline_code
-            result_dict["success"] = False
-            print(f"[ERROR] {decline_code}: {error_message}")
-        
-        if data.get('status') == 'requires_action' or data.get('next_action'):
-            result_dict["requires_3ds"] = True
-            print("[3DS] Required")
-
-async def safe_wait(page, ms):
-    try:
-        await page.wait_for_timeout(ms)
-        return True
-    except:
-        return False
-
-async def handle_captcha_with_cdp(client, page, timeout=CONFIG["CAPTCHA_SOLVE_TIMEOUT"]):
-    """Handle captcha automatically using BrightData's CDP API"""
-    try:
-        print("[CAPTCHA] Checking for captcha...")
-        
-        # Use CDP to wait for and solve captcha
-        result = await asyncio.wait_for(
-            asyncio.create_task(
-                asyncio.to_thread(
-                    client.send, 
-                    'Captcha.waitForSolve',
-                    {
-                        'detectTimeout': CONFIG["CAPTCHA_DETECT_TIMEOUT"],
-                        'solveTimeout': timeout * 1000  # Convert to milliseconds
-                    }
-                )
-            ),
-            timeout=timeout + 5  # Add buffer to timeout
-        )
-        
-        status = result.get('status', 'unknown')
-        print(f"[CAPTCHA] Status: {status}")
-        
-        if status == 'solved':
-            print("[CAPTCHA] ✓ Successfully solved")
-            return True
-        elif status == 'detected':
-            print("[CAPTCHA] Detected but not solved")
-            return False
-        else:
-            print("[CAPTCHA] Not detected")
-            return True  # No captcha to solve
-            
-    except asyncio.TimeoutError:
-        print("[CAPTCHA] Timeout waiting for solution")
-        return False
-    except Exception as e:
-        print(f"[CAPTCHA] Error: {e}")
-        return False
-
-async def run_stripe_automation(url, cc_string, email=None):
-    card = process_card_input(cc_string)
-    if not card:
-        return {"error": "Invalid card format"}
-    
-    email = email or f"test{random.randint(1000,9999)}@example.com"
-    random_name = generate_random_name()
-    
-    print(f"\n{'='*80}")
-    print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
-    print(f"[CARD] {card['number']} | {card['month']}/{card['year']} | {card['cvv']}")
-    print(f"[EMAIL] {email}")
-    print('='*80)
-    
-    stripe_result = {
-        "status": "pending",
-        "raw_responses": [],
-        "payment_confirmed": False,
-        "token_created": False,
-        "payment_method_created": False,
-        "payment_intent_created": False,
-        "success_url": None,
-        "requires_3ds": False,
-        "captcha_solved": False
-    }
-    
-    analyzer = StripeResponseAnalyzer()
-    
-    async with async_playwright() as p:
-        browser = None
-        context = None
-        page = None
-        payment_submitted = False
-        
-        try:
-            # Connect to browser
-            if CONFIG["RUN_LOCAL"]:
-                browser = await p.chromium.launch(headless=False, slow_mo=100)
-                print("[BROWSER] Local mode")
-            else:
-                # Use BrightData's scraping browser
-                auth = CONFIG["BRIGHTDATA_AUTH"]
-                if auth == 'brd-customer-hl_9e99ef01-zone-scraping_browser1:b8nk1xz9a83f':
-                    print("[WARNING] Using default BrightData credentials. Update BRIGHTDATA_AUTH in .env")
-                
-                endpoint_url = f'wss://{auth}@brd.superproxy.io:9222'
-                print(f"[BROWSER] Connecting to BrightData...")
-                
-                try:
-                    browser = await p.chromium.connect_over_cdp(endpoint_url, timeout=30000)
-                    print("[BROWSER] ✓ Connected to BrightData")
-                except Exception as e:
-                    print(f"[BROWSER] BrightData connection failed: {e}")
-                    print("[BROWSER] Falling back to local browser")
-                    browser = await p.chromium.launch(headless=True)
-            
-            # Create page
-            page = await browser.new_page()
-            
-            # Get CDP client for captcha handling
-            client = None
-            if not CONFIG["RUN_LOCAL"]:
-                try:
-                    client = await page.context.new_cdp_session(page)
-                    print("[CDP] Session created")
-                except Exception as e:
-                    print(f"[CDP] Failed to create session: {e}")
-            
-            # Response capture
-            async def capture_response(response):
-                try:
-                    if not analyzer.is_stripe_endpoint(response.url):
-                        return
-                    
-                    content_type = response.headers.get('content-type', '')
-                    if 'application/json' in content_type:
-                        try:
-                            body = await response.body()
-                            text = body.decode('utf-8', errors='ignore')
-                            analyzer.analyze_response(response.url, response.status, text, stripe_result)
-                        except:
-                            pass
-                except:
-                    pass
-            
-            page.on("response", capture_response)
-            
-            # Navigate
-            print("[NAV] Loading...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            print("[NAV] ✓ Loaded")
-            
-            await safe_wait(page, 3000)
-            
-            # Handle initial captcha if present
-            if client:
-                captcha_solved = await handle_captcha_with_cdp(client, page)
-                if captcha_solved:
-                    stripe_result["captcha_solved"] = True
-                    await safe_wait(page, 2000)
-            
-            # Fill email
-            print("[FILL] Email...")
-            email_filled = False
-            for selector in [
-                'input[type="email"]',
-                'input[name="email"]',
-                '#email',
-                'input[placeholder*="email" i]',
-                'input[id*="email" i]'
-            ]:
-                try:
-                    elements = await page.query_selector_all(selector)
-                    for element in elements:
-                        if await element.is_visible():
-                            await element.click()
-                            await element.fill("")
-                            await element.type(email, delay=50)
-                            email_filled = True
-                            print(f"[EMAIL] ✓ {email}")
-                            break
-                    if email_filled:
-                        break
-                except:
-                    continue
-            
-            await safe_wait(page, 1500)
-            
-            # Fill card details
-            print("[FILL] Card details...")
-            filled_status = {"card": False, "expiry": False, "cvc": False, "name": False}
-            
-            # Try to fill name if field exists
-            try:
-                name_selectors = [
-                    'input[name*="name" i]:not([name*="email"])',
-                    'input[placeholder*="name" i]:not([placeholder*="email"])',
-                    '#cardholder-name'
-                ]
-                for selector in name_selectors:
-                    elements = await page.query_selector_all(selector)
-                    for element in elements:
-                        if await element.is_visible():
-                            await element.click()
-                            await element.fill(random_name)
-                            filled_status["name"] = True
-                            print(f"[NAME] ✓ {random_name}")
-                            break
-                    if filled_status["name"]:
-                        break
-            except:
-                pass
-            
-            # Get all frames including nested ones
-            frames = page.frames
-            stripe_frames = [f for f in frames if 'stripe' in f.url.lower()]
-            print(f"[FRAMES] {len(stripe_frames)} Stripe frames found")
-            
-            # Fill card fields in frames
-            for attempt in range(3):
-                if all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
-                    break
-                    
-                print(f"[FILL] Attempt {attempt + 1}")
-                
-                for frame in stripe_frames:
-                    try:
-                        await frame.wait_for_load_state('domcontentloaded', timeout=5000)
-                        
-                        # Card number
-                        if not filled_status["card"]:
-                            card_selectors = [
-                                'input[placeholder*="1234" i]',
-                                'input[placeholder*="card number" i]',
-                                'input[name="cardnumber"]',
-                                'input[autocomplete="cc-number"]'
-                            ]
-                            for selector in card_selectors:
-                                try:
-                                    element = await frame.query_selector(selector)
-                                    if element and await element.is_visible():
-                                        await element.click()
-                                        await element.fill("")
-                                        for digit in card['number']:
-                                            await element.type(digit, delay=random.randint(30, 80))
-                                        filled_status["card"] = True
-                                        print(f"[CARD] ✓ {card['number']}")
-                                        break
-                                except:
-                                    continue
-                        
-                        # Expiry
-                        if not filled_status["expiry"]:
-                            expiry_selectors = [
-                                'input[placeholder*="mm" i]',
-                                'input[placeholder*="expir" i]',
-                                'input[name="exp-date"]',
-                                'input[autocomplete="cc-exp"]'
-                            ]
-                            for selector in expiry_selectors:
-                                try:
-                                    element = await frame.query_selector(selector)
-                                    if element and await element.is_visible():
-                                        await element.click()
-                                        await element.fill("")
-                                        exp_string = f"{card['month']}{card['year'][-2:]}"
-                                        for char in exp_string:
-                                            await element.type(char, delay=random.randint(30, 80))
-                                        filled_status["expiry"] = True
-                                        print(f"[EXPIRY] ✓ {card['month']}/{card['year'][-2:]}")
-                                        break
-                                except:
-                                    continue
-                        
-                        # CVC
-                        if not filled_status["cvc"]:
-                            cvc_selectors = [
-                                'input[placeholder*="cvc" i]',
-                                'input[placeholder*="cvv" i]',
-                                'input[placeholder*="security" i]',
-                                'input[name="cvc"]',
-                                'input[autocomplete="cc-csc"]'
-                            ]
-                            for selector in cvc_selectors:
-                                try:
-                                    element = await frame.query_selector(selector)
-                                    if element and await element.is_visible():
-                                        await element.click()
-                                        await element.fill("")
-                                        for digit in card['cvv']:
-                                            await element.type(digit, delay=random.randint(30, 80))
-                                        filled_status["cvc"] = True
-                                        print(f"[CVC] ✓ {card['cvv']}")
-                                        break
-                                except:
-                                    continue
-                    except Exception as e:
-                        print(f"[FRAME] Error in frame: {e}")
-                        continue
-                
-                if not all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
-                    await safe_wait(page, 1000)
-            
-            print(f"[STATUS] {filled_status}")
-            
-            # Wait for validation
-            await safe_wait(page, 3000)
-            
-            # Check for captcha before submit
-            if client:
-                await handle_captcha_with_cdp(client, page, timeout=20)
-            
-            # Submit payment
-            print("[SUBMIT] Looking for submit button...")
-            submit_selectors = [
-                'button[type="submit"]:visible',
-                'button.SubmitButton:visible',
-                'button:has-text("pay"):visible',
-                'button:has-text("submit"):visible',
-                'button:has-text("complete"):visible'
-            ]
-            
-            for selector in submit_selectors:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.count() > 0:
-                        is_disabled = await btn.get_attribute('disabled')
-                        if is_disabled is None or is_disabled == 'false':
-                            await btn.click()
-                            payment_submitted = True
-                            print(f"[SUBMIT] ✓ Clicked: {selector}")
-                            break
-                except:
-                    continue
-            
-            if not payment_submitted:
-                await page.keyboard.press('Enter')
-                payment_submitted = True
-                print("[SUBMIT] ✓ Enter key pressed")
-            
-            # Wait for payment processing with captcha check
-            print("[WAIT] Processing payment...")
-            await safe_wait(page, 5000)
-            
-            # Check for captcha after submit
-            if client:
-                await handle_captcha_with_cdp(client, page, timeout=30)
-                await safe_wait(page, 2000)
-            
-            # Monitor for response
-            print("[MONITORING] Waiting for confirmation...")
-            start_time = time.time()
-            max_wait = CONFIG["RESPONSE_TIMEOUT_SECONDS"]
-            
-            while time.time() - start_time < max_wait:
-                elapsed = time.time() - start_time
-                
-                if stripe_result.get("payment_confirmed"):
-                    print("[✓✓✓ SUCCESS] Payment confirmed!")
-                    break
-                
-                if stripe_result.get("error"):
-                    print(f"[ERROR] {stripe_result['error']}")
-                    break
-                
-                if stripe_result.get("requires_3ds"):
-                    print("[3DS] Authentication required")
-                    break
-                
-                # Check URL for success
-                try:
-                    current_url = page.url
-                    success_url = stripe_result.get("success_url")
-                    
-                    if success_url and current_url.startswith(success_url):
-                        print(f"[✓ SUCCESS] Redirected to: {current_url[:80]}")
-                        stripe_result["payment_confirmed"] = True
-                        stripe_result["success"] = True
-                        break
-                    
-                    if any(x in current_url.lower() for x in ['success', 'thank-you', 'complete', 'confirmed']):
-                        print(f"[SUCCESS PAGE] {current_url[:80]}")
-                        stripe_result["payment_confirmed"] = True
-                        stripe_result["success"] = True
-                        break
-                except:
-                    pass
-                
-                await asyncio.sleep(0.5)
-            
-            print(f"\n[SUMMARY] {len(stripe_result['raw_responses'])} Stripe API responses captured")
-            
-            # Build final response
-            if stripe_result.get("payment_confirmed"):
-                return {
-                    "success": True,
-                    "message": stripe_result.get("message", "Payment successful"),
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "payment_intent_id": stripe_result.get("payment_intent_id"),
-                    "token_id": stripe_result.get("token_id"),
-                    "payment_method_id": stripe_result.get("payment_method_id"),
-                    "captcha_solved": stripe_result.get("captcha_solved"),
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-            elif stripe_result.get("requires_3ds"):
-                return {
-                    "success": False,
-                    "requires_3ds": True,
-                    "message": "3D Secure required",
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "captcha_solved": stripe_result.get("captcha_solved"),
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-            elif stripe_result.get("error"):
-                return {
-                    "success": False,
-                    "error": stripe_result["error"],
-                    "decline_code": stripe_result.get("decline_code"),
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "captcha_solved": stripe_result.get("captcha_solved"),
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": "Payment not confirmed",
-                    "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                    "details": {
-                        "filled": filled_status,
-                        "payment_submitted": payment_submitted,
-                        "captcha_solved": stripe_result.get("captcha_solved"),
-                        "responses": len(stripe_result["raw_responses"])
-                    },
-                    "raw_responses": stripe_result["raw_responses"]
-                }
-                
+            self.conn = psycopg2.connect(self.uri)
+            logger.info("Connected to Postgres")
         except Exception as e:
-            print(f"[ERROR] {str(e)}")
-            return {
-                "error": f"Automation failed: {str(e)}",
-                "captcha_solved": stripe_result.get("captcha_solved", False),
-                "raw_responses": stripe_result.get("raw_responses", [])
+            logger.exception("Postgres connection failed: %s", e)
+            self.conn = None
+
+    def search_mobile(self, mobile: str) -> List[Dict[str, Any]]:
+        if not self.uri:
+            return []
+        if not self.conn:
+            self.connect()
+            if not self.conn:
+                return []
+        try:
+            cleaned = clean_mobile_number(mobile)
+            cur = self.conn.cursor()
+            q = "SELECT mobile, name, fname, address, alt, circle, aadhar, email FROM users_data WHERE mobile = %s"
+            cur.execute(q, (cleaned,))
+            rows = cur.fetchall()
+            cur.close()
+            results = []
+            for r in rows:
+                rec = {}
+                for i, field in enumerate(USER_DATA_FIELDS):
+                    if i < len(r) and r[i] is not None and r[i] != "":
+                        rec[field] = r[i]
+                if rec:
+                    results.append(rec)
+            return results
+        except Exception as e:
+            logger.exception("Postgres search error: %s", e)
+            return []
+
+pg = PostgresDB(POSTGRES_URI)
+
+# -------------------------
+# JSON-based data store
+# -------------------------
+_data_lock = threading.Lock()
+
+DEFAULT_STORE = {
+    "users": {},
+    "search_history": {},
+    "search_logs": [],
+    "redeem_codes": {},
+    "blacklist": {},
+}
+
+def safe_load_store(path=DATA_STORE_PATH):
+    with _data_lock:
+        if not os.path.exists(path):
+            safe_write_store(DEFAULT_STORE, path)
+            return json.loads(json.dumps(DEFAULT_STORE))
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k in DEFAULT_STORE:
+                    if k not in data:
+                        data[k] = DEFAULT_STORE[k]
+                return data
+        except Exception as e:
+            logger.exception("Failed to read data store: %s. Attempting recovery.", e)
+            if os.path.exists(BACKUP_PATH):
+                shutil.copy(BACKUP_PATH, path)
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            else:
+                safe_write_store(DEFAULT_STORE, path)
+                return json.loads(json.dumps(DEFAULT_STORE))
+
+def safe_write_store(store: dict, path=DATA_STORE_PATH):
+    with _data_lock:
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(store, f, ensure_ascii=False, indent=2, default=str)
+            if os.path.exists(path):
+                shutil.copy(path, BACKUP_PATH)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            logger.exception("Failed to write data store: %s", e)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+_store = safe_load_store()
+
+def persist_store():
+    safe_write_store(_store)
+
+# -------------------------
+# Helpers and formatting
+# -------------------------
+def is_owner(user_id: int) -> bool:
+    return int(user_id) in OWNER_IDS
+
+def clean_mobile_number(mobile: str) -> str:
+    if not mobile:
+        return ""
+    m = re.sub(r"[^\d]", "", str(mobile))
+    if m.startswith("91") and len(m) > 10:
+        m = m[2:]
+    return m[-10:] if len(m) >= 10 else m
+
+def validate_mobile_number(mobile: str) -> (bool, Optional[str]):
+    cleaned = clean_mobile_number(mobile)
+    if len(cleaned) == 10 and cleaned[0] in '6789':
+        return True, cleaned
+    return False, None
+
+def now_iso():
+    return datetime.utcnow().isoformat()
+
+def html_escape(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+def format_user_data_html(data_list):
+    if not data_list:
+        return "<b>No data found for this mobile number.</b>"
+    out = f"<b>Search Results</b> — <i>{len(data_list)} record(s)</i>\n\n"
+    for idx, data in enumerate(data_list, 1):
+        out += f"<b>Result {idx}</b>\n"
+        for field in USER_DATA_FIELDS:
+            if field in data and data[field]:
+                label = {
+                    'mobile': 'Mobile',
+                    'name': 'Name',
+                    'fname': "Father's Name",
+                    'address': 'Address',
+                    'alt': 'Alternate',
+                    'circle': 'Circle',
+                    'aadhar': 'Aadhar',
+                    'email': 'Email'
+                }.get(field, field)
+                out += f"<b>{html_escape(label)}:</b> <code>{html_escape(str(data[field]))}</code>\n"
+        out += "\n"
+    return out
+
+def format_pricing_plans_html(plans):
+    lines = ["<b>Pricing Plans</b>\n"]
+    for name, d in plans.items():
+        per_search = d['price'] / d['credits'] if d['credits'] else 0
+        lines.append(f"<b>{html_escape(name.title())}</b> — {html_escape(d['description'])}\n• Price: ₹{d['price']} • Credits: {d['credits']} (≈ ₹{per_search:.1f}/search)\n")
+    lines.append(f"\nContact: {html_escape(SUPPORT_BOT)}")
+    return "\n".join(lines)
+
+# -------------------------
+# JSON store operations (users, credits, history, redeem, blacklist)
+# -------------------------
+def ensure_user(user_id: int, username: Optional[str]=None, first_name: Optional[str]=None):
+    uid = str(int(user_id))
+    with _data_lock:
+        users = _store.setdefault("users", {})
+        if uid not in users:
+            users[uid] = {
+                "user_id": int(user_id),
+                "username": username,
+                "first_name": first_name,
+                "credits": DEFAULT_CREDITS,
+                "created_at": now_iso(),
+                "last_updated": now_iso()
             }
-            
-        finally:
-            if page:
-                try:
-                    await page.close()
-                except:
-                    pass
-            if browser:
-                try:
-                    await browser.close()
-                except:
-                    pass
-            print("[CLEANUP] ✓")
+            persist_store()
+        else:
+            changed = False
+            if username and users[uid].get("username") != username:
+                users[uid]["username"] = username; changed = True
+            if first_name and users[uid].get("first_name") != first_name:
+                users[uid]["first_name"] = first_name; changed = True
+            if changed:
+                users[uid]["last_updated"] = now_iso()
+                persist_store()
 
-@app.route('/hrkXstripe', methods=['GET'])
-def stripe_endpoint():
-    can_proceed, wait_time = rate_limit_check()
-    if not can_proceed:
-        return jsonify({"error": "Rate limit exceeded", "retry_after": f"{wait_time:.1f}s"}), 429
-    
-    url = request.args.get('url')
-    cc = request.args.get('cc')
-    email = request.args.get('email')
-    
-    print(f"\n{'='*80}")
-    print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[URL] {url[:100]}..." if url else "[URL] None")
-    print(f"[CC] {cc}")
-    print('='*80)
-    
-    if not url or not cc:
-        return jsonify({"error": "Missing parameters: url and cc"}), 400
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
+def get_user_credits(user_id: int):
+    if is_owner(user_id):
+        return "Unlimited"
+    uid = str(int(user_id))
+    with _data_lock:
+        u = _store.get("users", {}).get(uid)
+        return u.get("credits", 0) if u else 0
+
+def add_credits(user_id: int, credits: int):
+    uid = str(int(user_id))
+    with _data_lock:
+        users = _store.setdefault("users", {})
+        if uid not in users:
+            users[uid] = {"user_id": int(user_id), "credits": max(0, credits), "created_at": now_iso(), "last_updated": now_iso()}
+        else:
+            users[uid]["credits"] = users[uid].get("credits", 0) + credits
+            users[uid]["last_updated"] = now_iso()
+        persist_store()
+
+def deduct_credits(user_id: int, credits: int=1) -> bool:
+    if is_owner(user_id):
+        return True
+    uid = str(int(user_id))
+    with _data_lock:
+        users = _store.setdefault("users", {})
+        u = users.get(uid)
+        if not u:
+            return False
+        if u.get("credits", 0) < credits:
+            return False
+        u["credits"] = u.get("credits", 0) - credits
+        u["last_updated"] = now_iso()
+        persist_store()
+        return True
+
+def log_search(user_id: int, username: Optional[str], mobile: str, results_count: int, credits_deducted: int):
+    entry = {
+        "user_id": int(user_id),
+        "username": username,
+        "mobile": clean_mobile_number(mobile),
+        "timestamp": now_iso(),
+        "results_count": int(results_count),
+        "credits_deducted": int(credits_deducted)
+    }
+    with _data_lock:
+        _store.setdefault("search_logs", []).append(entry)
+        if len(_store["search_logs"]) > 5000:
+            _store["search_logs"] = _store["search_logs"][-5000:]
+        persist_store()
+
+def save_search_history(user_id: int, mobile: str, data: List[Dict[str, Any]]):
+    uid = str(int(user_id))
+    m = clean_mobile_number(mobile)
+    with _data_lock:
+        hist = _store.setdefault("search_history", {}).setdefault(uid, {})
+        hist[m] = {"data": data, "timestamp": now_iso()}
+        persist_store()
+
+def get_search_history(user_id: int, mobile: str):
+    uid = str(int(user_id))
+    m = clean_mobile_number(mobile)
+    with _data_lock:
+        return _store.get("search_history", {}).get(uid, {}).get(m)
+
+def get_user_search_history_list(user_id: int, limit: int=20):
+    uid = str(int(user_id))
+    with _data_lock:
+        d = _store.get("search_history", {}).get(uid, {})
+        items = sorted(d.items(), key=lambda kv: kv[1].get("timestamp", ""), reverse=True)[:limit]
+        return [{"mobile": k, "timestamp": v.get("timestamp"), "data": v.get("data")} for k, v in items]
+
+# redeem codes
+def generate_redeem_codes(credits: int, count: int, generated_by: int) -> List[str]:
+    codes = []
+    with _data_lock:
+        rc = _store.setdefault("redeem_codes", {})
+        for _ in range(count):
+            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            while code in rc:
+                code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            rc[code] = {
+                "code": code,
+                "credits": int(credits),
+                "is_used": False,
+                "used_by": None,
+                "used_at": None,
+                "generated_by": int(generated_by),
+                "generated_at": now_iso()
+            }
+            codes.append(code)
+        persist_store()
+    return codes
+
+def redeem_code(user_id: int, code: str):
+    code_up = code.strip().upper()
+    with _data_lock:
+        rc = _store.setdefault("redeem_codes", {})
+        doc = rc.get(code_up)
+        if not doc:
+            return False, "Invalid or already used redemption code"
+        if doc["is_used"]:
+            return False, "Code already used"
+        doc["is_used"] = True
+        doc["used_by"] = int(user_id)
+        doc["used_at"] = now_iso()
+        add_credits(user_id, int(doc["credits"]))
+        persist_store()
+        return True, int(doc["credits"])
+
+# blacklist
+def add_to_blacklist(mobile: str, added_by: int, reason: Optional[str]=None):
+    m = clean_mobile_number(mobile)
+    with _data_lock:
+        bl = _store.setdefault("blacklist", {})
+        if m in bl and bl[m].get("is_active", False):
+            return False, "Already blacklisted"
+        bl[m] = {
+            "mobile": m,
+            "is_active": True,
+            "added_by": int(added_by),
+            "reason": reason or "No reason provided",
+            "added_at": now_iso(),
+            "removed_at": None
+        }
+        persist_store()
+        return True, "Blacklisted"
+
+def remove_from_blacklist(mobile: str):
+    m = clean_mobile_number(mobile)
+    with _data_lock:
+        bl = _store.setdefault("blacklist", {})
+        if m not in bl or not bl[m].get("is_active", False):
+            return False, "Not found in blacklist"
+        bl[m]["is_active"] = False
+        bl[m]["removed_at"] = now_iso()
+        persist_store()
+        return True, "Removed from blacklist"
+
+def is_blacklisted(mobile: str) -> bool:
+    m = clean_mobile_number(mobile)
+    with _data_lock:
+        bl = _store.get("blacklist", {})
+        return bool(bl.get(m, {}).get("is_active", False))
+
+# -------------------------
+# UI: refined keyboards and layout
+# -------------------------
+def main_menu_keyboard(is_owner_user=False):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("🔍 Search", callback_data="search_mobile"),
+           InlineKeyboardButton("📋 History", callback_data="my_history"))
+    kb.add(InlineKeyboardButton("💳 Credits", callback_data="my_credits"),
+           InlineKeyboardButton("💰 Buy", callback_data="buy_credits"))
+    kb.add(InlineKeyboardButton("🆘 Support", url=SUPPORT_BOT),
+           InlineKeyboardButton("ℹ️ Help", callback_data="help"))
+    if is_owner_user:
+        kb.add(InlineKeyboardButton("📊 Admin", callback_data="admin_stats"),
+               InlineKeyboardButton("🎫 Redeem Stats", callback_data="redeem_stats"))
+    return kb
+
+def compact_back_keyboard():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"))
+    return kb
+
+# -------------------------
+# Auto-delete helper
+# -------------------------
+def schedule_delete(chat_id: int, message_id: int, delay_minutes: int=DATA_EXPIRY_MINUTES):
+    def worker():
+        try:
+            bot.delete_message(chat_id, message_id)
+            logger.debug("Auto-deleted %s:%s", chat_id, message_id)
+        except Exception as e:
+            logger.debug("Auto-delete failed: %s", e)
+    t = threading.Timer(delay_minutes * 60, worker)
+    t.daemon = True
+    t.start()
+    return t
+
+# -------------------------
+# Bot handlers
+# -------------------------
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    user_id = message.from_user.id
+    ensure_user(user_id, message.from_user.username, message.from_user.first_name)
+    credits = get_user_credits(user_id)
+    header = f"<b>{html_escape(BOT_NAME)}</b>\n<i>{html_escape(COMPANY_LINE)}</i>\n\n"
+    body = (f"{header}"
+            f"Welcome, <b>{html_escape(message.from_user.first_name or message.from_user.username or str(user_id))}</b> 👋\n"
+            f"<b>Credits:</b> {html_escape(str(credits))}\n\n"
+            f"{html_escape(PRIVACY_NOTE)}")
+    kb = main_menu_keyboard(is_owner(user_id))
+    bot.send_message(user_id, body, parse_mode='HTML', reply_markup=kb)
+
+@bot.message_handler(commands=['help'])
+def cmd_help(message):
+    help_text = (
+        "<b>How to use</b>\n\n"
+        "• Send a 10-digit mobile number (e.g. <code>9876543210</code>) to perform a lookup.\n"
+        "• Use the buttons to view history, check credits, or purchase more.\n"
+        "• Admins can manage credits and generate redeem codes.\n\n"
+        f"<b>Support:</b> {html_escape(SUPPORT_BOT)}"
+    )
+    bot.send_message(message.chat.id, help_text, parse_mode='HTML', reply_markup=compact_back_keyboard())
+
+# Admin: add credits
+@bot.message_handler(regexp=r'^/add\s+\d+\s+\d+$')
+def cmd_add(msg):
+    if not is_owner(msg.from_user.id):
+        bot.reply_to(msg, "❌ You are not authorized to use this command.")
+        return
+    parts = msg.text.split()
+    target = int(parts[1]); credits = int(parts[2])
+    add_credits(target, credits)
+    bot.reply_to(msg, f"✅ Added <b>{credits}</b> credits to <code>{target}</code>. New balance: <b>{get_user_credits(target)}</b>", parse_mode='HTML')
+
+# Admin: remove credits
+@bot.message_handler(regexp=r'^/remove\s+\d+\s+\d+$')
+def cmd_remove(msg):
+    if not is_owner(msg.from_user.id):
+        bot.reply_to(msg, "❌ You are not authorized to use this command.")
+        return
+    parts = msg.text.split()
+    target = int(parts[1]); credits = int(parts[2])
+    if is_owner(target):
+        bot.reply_to(msg, "❌ Cannot remove credits from owner.")
+        return
+    add_credits(target, -credits)
+    bot.reply_to(msg, f"✅ Removed <b>{credits}</b> credits from <code>{target}</code>. New balance: <b>{get_user_credits(target)}</b>", parse_mode='HTML')
+
+# Admin: generate redeem codes
+@bot.message_handler(regexp=r'^/redemption\s+\d+\s+\d+$')
+def cmd_redemption(msg):
+    if not is_owner(msg.from_user.id):
+        bot.reply_to(msg, "❌ You are not authorized.")
+        return
+    parts = msg.text.split()
+    credits = int(parts[1]); count = int(parts[2])
+    if count > 500:
+        bot.reply_to(msg, "❌ Maximum 500 codes at once.")
+        return
+    codes = generate_redeem_codes(credits, count, msg.from_user.id)
+    codes_text = "\n".join(codes)
+    if len(codes_text) > 3000:
+        fname = f"redeem_{int(time.time())}.txt"
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write(codes_text)
+        with open(fname, "rb") as f:
+            bot.send_document(msg.chat.id, f, caption=f"Generated {count} codes ({credits} credits each)")
+        os.remove(fname)
+    else:
+        bot.reply_to(msg, f"✅ Generated <b>{count}</b> codes (each <b>{credits}</b> credits):\n<pre>{html_escape(codes_text)}</pre>", parse_mode='HTML')
+
+# Redeem
+@bot.message_handler(regexp=r'^/redeem\s+[A-Za-z0-9]{8}$')
+def cmd_redeem(msg):
+    code = msg.text.split()[1].upper()
+    ok, result = redeem_code(msg.from_user.id, code)
+    if ok:
+        bot.reply_to(msg, f"🎉 Redeemed <b>{code}</b> — +{result} credits.\nNew balance: <b>{get_user_credits(msg.from_user.id)}</b>", parse_mode='HTML')
+    else:
+        bot.reply_to(msg, f"❌ {html_escape(result)}", parse_mode='HTML')
+
+# Blacklist add (admin)
+@bot.message_handler(regexp=r'^/blacklist\s+.+')
+def cmd_blacklist(msg):
+    if not is_owner(msg.from_user.id):
+        bot.reply_to(msg, "❌ You are not authorized.")
+        return
+    parts = msg.text.split(maxsplit=2)
+    mobile = parts[1]
+    reason = parts[2] if len(parts) > 2 else "No reason provided"
+    ok, message = add_to_blacklist(mobile, msg.from_user.id, reason)
+    if ok:
+        bot.reply_to(msg, f"✅ Blacklisted <code>+91{clean_mobile_number(mobile)}</code>", parse_mode='HTML')
+    else:
+        bot.reply_to(msg, f"❌ {html_escape(message)}", parse_mode='HTML')
+
+# Unblacklist (admin)
+@bot.message_handler(regexp=r'^/unblacklist\s+.+')
+def cmd_unblacklist(msg):
+    if not is_owner(msg.from_user.id):
+        bot.reply_to(msg, "❌ You are not authorized.")
+        return
+    mobile = msg.text.split(maxsplit=1)[1]
+    ok, message = remove_from_blacklist(mobile)
+    if ok:
+        bot.reply_to(msg, f"✅ Removed <code>{clean_mobile_number(mobile)}</code> from blacklist", parse_mode='HTML')
+    else:
+        bot.reply_to(msg, f"❌ {html_escape(message)}", parse_mode='HTML')
+
+# History
+@bot.message_handler(commands=['history'])
+def cmd_history(msg):
+    hist = get_user_search_history_list(msg.from_user.id, limit=50)
+    if not hist:
+        bot.reply_to(msg, "📋 <b>Your search history is empty.</b>", parse_mode='HTML')
+        return
+    text = "<b>Your Search History</b>\n\n"
+    for i, entry in enumerate(hist[:20], 1):
+        ts = entry.get("timestamp", "")
+        text += f"{i}. <code>{html_escape(entry.get('mobile'))}</code> — {html_escape(ts)}\n"
+    bot.reply_to(msg, text, parse_mode='HTML')
+
+# Callback queries (UI actions)
+@bot.callback_query_handler(func=lambda c: True)
+def callback_handler(call):
+    uid = call.from_user.id
+    data = call.data
     try:
-        result = loop.run_until_complete(run_stripe_automation(url, cc, email))
-        print(f"[RESULT] {'✓ SUCCESS' if result.get('success') else '✗ FAILED'}")
-        return jsonify(result), 200 if result.get('success') else 400
+        if data == "main_menu":
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=f"🏠 <b>Main Menu</b>", parse_mode='HTML', reply_markup=main_menu_keyboard(is_owner(uid)))
+            return
+        if data == "search_mobile":
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text="🔍 Send a 10-digit mobile number (e.g. <code>9876543210</code>).", parse_mode='HTML', reply_markup=compact_back_keyboard())
+            return
+        if data == "my_history":
+            hist = get_user_search_history_list(uid, limit=50)
+            if not hist:
+                bot.answer_callback_query(call.id, "No history")
+                bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                      text="📋 <b>Your search history is empty.</b>", parse_mode='HTML', reply_markup=main_menu_keyboard(is_owner(uid)))
+                return
+            text = "<b>Your Search History</b>\n\n"
+            for i, entry in enumerate(hist[:20], 1):
+                ts = entry.get("timestamp", "")
+                text += f"{i}. <code>{html_escape(entry.get('mobile'))}</code> — {html_escape(ts)}\n"
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=text, parse_mode='HTML', reply_markup=main_menu_keyboard(is_owner(uid)))
+            return
+        if data == "my_credits":
+            credits = get_user_credits(uid)
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=f"💳 <b>Credits:</b> {html_escape(str(credits))}", parse_mode='HTML', reply_markup=main_menu_keyboard(is_owner(uid)))
+            return
+        if data == "buy_credits":
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=format_pricing_plans_html(PRICING_PLANS), parse_mode='HTML', reply_markup=compact_back_keyboard())
+            return
+        if data == "help":
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text="ℹ️ Use /help for instructions.", parse_mode='HTML', reply_markup=compact_back_keyboard())
+            return
+        if data == "admin_stats" and is_owner(uid):
+            with _data_lock:
+                users_count = len(_store.get("users", {}))
+                searches = len(_store.get("search_logs", []))
+            stats_msg = f"📊 <b>Admin Stats</b>\n\n• Users: <b>{users_count}</b>\n• Searches logged: <b>{searches}</b>"
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=stats_msg, parse_mode='HTML', reply_markup=main_menu_keyboard(True))
+            return
+        if data == "redeem_stats" and is_owner(uid):
+            with _data_lock:
+                total = len(_store.get("redeem_codes", {}))
+                used = sum(1 for v in _store.get("redeem_codes", {}).values() if v.get("is_used"))
+                unused = total - used
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                  text=f"🎫 <b>Redeem Codes</b>\n\n• Total: <b>{total}</b>\n• Used: <b>{used}</b>\n• Unused: <b>{unused}</b>", parse_mode='HTML', reply_markup=main_menu_keyboard(True))
+            return
     except Exception as e:
-        print(f"[SERVER ERROR] {e}")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        loop.close()
+        logger.exception("Callback error: %s", e)
 
-@app.route('/status', methods=['GET'])
-def status_endpoint():
-    return jsonify({
-        "status": "online",
-        "version": "4.0-brightdata",
-        "features": {
-            "captcha_solver": "BrightData CDP",
-            "auto_captcha": True,
-            "proxy_support": True,
-            "location_change": True
-        },
-        "timestamp": datetime.now().isoformat()
-    })
+# Text handler: handle 10-digit numbers
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def text_handler(message):
+    text = (message.text or "").strip()
+    user_id = message.from_user.id
+    # ignore slash commands here (they're handled above)
+    if text.startswith("/"):
+        return
+    valid, cleaned = validate_mobile_number(text)
+    if not valid:
+        # quietly ignore other messages (or optionally reply)
+        return
+    ensure_user(user_id, message.from_user.username, message.from_user.first_name)
+    # blacklist check
+    if not is_owner(user_id) and is_blacklisted(cleaned):
+        bot.send_message(user_id, "🚫 This number is unavailable for lookup.", parse_mode='HTML', reply_markup=main_menu_keyboard(is_owner(user_id)))
+        return
+    # check local history
+    hist = get_search_history(user_id, cleaned)
+    if hist:
+        formatted = format_user_data_html(hist.get("data"))
+        sent = bot.send_message(user_id, f"📁 <b>From your history</b>\n\n{formatted}\n\n⏰ This message will be deleted in {DATA_EXPIRY_MINUTES} minutes.", parse_mode='HTML')
+        schedule_delete(sent.chat.id, sent.message_id, delay_minutes=DATA_EXPIRY_MINUTES)
+        return
+    # credits check
+    credits = get_user_credits(user_id)
+    if not is_owner(user_id) and (not isinstance(credits, int) or credits < 1):
+        bot.send_message(user_id, f"⚠️ <b>Insufficient credits</b>\nBalance: {html_escape(str(credits))}\nContact {html_escape(SUPPORT_BOT)} to purchase credits.", parse_mode='HTML', reply_markup=main_menu_keyboard(is_owner(user_id)))
+        return
+    searching_msg = bot.send_message(user_id, f"⏳ Searching <code>{html_escape(cleaned)}</code> — please wait...", parse_mode='HTML')
+    results = pg.search_mobile(cleaned) if pg and POSTGRES_URI else []
+    if results:
+        deducted = 0
+        if not is_owner(user_id):
+            ok = deduct_credits(user_id, 1)
+            if not ok:
+                bot.edit_message_text(chat_id=searching_msg.chat.id, message_id=searching_msg.message_id, text="❌ Could not deduct credits.", parse_mode='HTML')
+                return
+            deducted = 1
+        save_search_history(user_id, cleaned, results)
+        if not is_owner(user_id):
+            log_search(user_id, message.from_user.username or "unknown", cleaned, len(results), deducted)
+        formatted = format_user_data_html(results)
+        bot.edit_message_text(chat_id=searching_msg.chat.id, message_id=searching_msg.message_id,
+                              text=f"✅ <b>Search Successful</b>\n\n{formatted}\n\n💳 Remaining Credits: <b>{html_escape(str(get_user_credits(user_id)))}</b>\n\n⏰ This message will be deleted in {DATA_EXPIRY_MINUTES} minutes.", parse_mode='HTML')
+        schedule_delete(searching_msg.chat.id, searching_msg.message_id, delay_minutes=DATA_EXPIRY_MINUTES)
+    else:
+        bot.edit_message_text(chat_id=searching_msg.chat.id, message_id=searching_msg.message_id,
+                              text=f"🔎 <b>No data found</b>\n\n<code>{html_escape(cleaned)}</code>\nCredits not deducted.", parse_mode='HTML', reply_markup=main_menu_keyboard(is_owner(user_id)))
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
-    print("="*80)
-    print("[SERVER] Stripe Automation v4.0 - BrightData Integration")
-    print(f"[PORT] {port}")
-    print(f"[CAPTCHA] BrightData Auto-Solve Enabled")
-    print(f"[MODE] {'Local' if CONFIG['RUN_LOCAL'] else 'BrightData Cloud'}")
-    print("="*80)
-    app.run(host='0.0.0.0', port=port, debug=False)
+# -------------------------
+# Starter
+# -------------------------
+def main():
+    logger.info("Starting refined bot...")
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    except KeyboardInterrupt:
+        logger.info("Shutting down (KeyboardInterrupt)")
+    except Exception as e:
+        logger.exception("Bot stopped unexpectedly: %s", e)
+
+if __name__ == "__main__":
+    main()
+
