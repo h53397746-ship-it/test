@@ -13,6 +13,9 @@ from dotenv import load_dotenv
 from collections import deque
 import httpx
 from urllib.parse import parse_qs
+import traceback
+from typing import Dict, List, Any, Optional
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -20,36 +23,40 @@ CONFIG = {
     "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
     "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
     "TWOCAPTCHA_API_KEY": os.getenv('TWOCAPTCHA_API_KEY'),
-    "RESPONSE_TIMEOUT_SECONDS": 30,  # Reduced for speed
-    "RETRY_DELAY": 1000,  # Reduced for speed
-    "RATE_LIMIT_REQUESTS": 10,  # Increased
+    "RESPONSE_TIMEOUT_SECONDS": 45,
+    "RETRY_DELAY": 1000,
+    "RATE_LIMIT_REQUESTS": 10,
     "RATE_LIMIT_WINDOW": 60,
-    "MAX_RETRIES": 2,
-    "BROWSERLESS_TIMEOUT": 60000,
-    "CAPTCHA_TIMEOUT": 120,
-    "FAST_MODE": True,  # Enable speed optimizations
-    "LOG_REQUEST_BODIES": True  # Enable request body logging
+    "MAX_RETRIES": 3,
+    "BROWSERLESS_TIMEOUT": 90000,
+    "CAPTCHA_TIMEOUT": 180,
+    "FAST_MODE": True,
+    "LOG_REQUEST_BODIES": True,
+    "RENDER_WAIT": 3000,  # Wait for full render
+    "MAX_FRAME_RETRIES": 3,
+    "NETWORK_IDLE_TIMEOUT": 5000
 }
 
 app = Flask(__name__)
 request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
 
-# 2Captcha solver class (unchanged)
+# Enhanced 2Captcha solver with retry logic
 class TwoCaptchaSolver:
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "http://2captcha.com"
+        self.client = httpx.AsyncClient(timeout=30.0)
         
-    async def solve_hcaptcha(self, sitekey, page_url):
-        """Solve HCaptcha using 2captcha service"""
+    async def solve_hcaptcha(self, sitekey, page_url, max_retries=2):
+        """Solve HCaptcha with retry logic"""
         if not self.api_key:
             print("[CAPTCHA] No 2captcha API key configured")
             return None
             
-        print(f"[CAPTCHA] Submitting HCaptcha to 2captcha...")
-        
-        try:
-            async with httpx.AsyncClient() as client:
+        for attempt in range(max_retries):
+            print(f"[CAPTCHA] Attempt {attempt + 1}/{max_retries} - Submitting HCaptcha...")
+            
+            try:
                 submit_data = {
                     'key': self.api_key,
                     'method': 'hcaptcha',
@@ -58,22 +65,26 @@ class TwoCaptchaSolver:
                     'json': 1
                 }
                 
-                response = await client.post(f"{self.base_url}/in.php", data=submit_data)
+                response = await self.client.post(f"{self.base_url}/in.php", data=submit_data)
                 result = response.json()
                 
                 if result.get('status') != 1:
                     print(f"[CAPTCHA] Submit failed: {result.get('error_text', 'Unknown error')}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(3)
+                        continue
                     return None
                 
                 captcha_id = result.get('request')
                 print(f"[CAPTCHA] Task ID: {captcha_id}")
                 
+                # Poll for result
                 start_time = time.time()
                 while time.time() - start_time < CONFIG["CAPTCHA_TIMEOUT"]:
                     await asyncio.sleep(5)
                     
                     check_url = f"{self.base_url}/res.php?key={self.api_key}&action=get&id={captcha_id}&json=1"
-                    response = await client.get(check_url)
+                    response = await self.client.get(check_url)
                     result = response.json()
                     
                     if result.get('status') == 1:
@@ -86,36 +97,52 @@ class TwoCaptchaSolver:
                         continue
                     else:
                         print(f"[CAPTCHA] Error: {result.get('error_text', 'Unknown')}")
-                        return None
+                        break
                 
                 print("[CAPTCHA] Timeout waiting for solution")
-                return None
                 
-        except Exception as e:
-            print(f"[CAPTCHA] Error: {e}")
-            return None
+            except Exception as e:
+                print(f"[CAPTCHA] Error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(3)
+                    
+        return None
 
-# Enhanced captcha detection and handling
+# Enhanced Captcha Handler with better detection
 class CaptchaHandler:
     @staticmethod
-    async def detect_hcaptcha(page):
-        """Detect HCaptcha on the page"""
+    async def detect_captcha(page, frame=None):
+        """Comprehensive captcha detection"""
+        context = frame or page
+        
         try:
-            hcaptcha_frame = await page.query_selector('iframe[src*="hcaptcha.com"]')
-            if hcaptcha_frame:
-                print("[CAPTCHA] HCaptcha iframe detected")
-                return True
-                
-            hcaptcha_div = await page.query_selector('div[data-hcaptcha-widget-id]')
-            if hcaptcha_div:
-                print("[CAPTCHA] HCaptcha widget detected")
-                return True
-                
-            hcaptcha_element = await page.query_selector('.h-captcha')
-            if hcaptcha_element:
-                print("[CAPTCHA] HCaptcha element detected")
-                return True
-                
+            # Check for various captcha types
+            captcha_selectors = [
+                'iframe[src*="hcaptcha.com"]',
+                'iframe[src*="recaptcha"]',
+                'iframe[src*="arkoselabs"]',
+                'div[data-hcaptcha-widget-id]',
+                '.h-captcha',
+                '.g-recaptcha',
+                '#cf-hcaptcha-container',
+                'div[id*="captcha"]',
+                'div[class*="captcha"]'
+            ]
+            
+            for selector in captcha_selectors:
+                element = await context.query_selector(selector)
+                if element and await element.is_visible():
+                    print(f"[CAPTCHA] Detected: {selector}")
+                    return True
+            
+            # Check page content for captcha scripts
+            content = await context.content()
+            captcha_indicators = ['hcaptcha', 'recaptcha', 'challenge-platform', 'cf-captcha']
+            for indicator in captcha_indicators:
+                if indicator in content.lower():
+                    print(f"[CAPTCHA] Script detected: {indicator}")
+                    return True
+                    
             return False
             
         except Exception as e:
@@ -123,29 +150,53 @@ class CaptchaHandler:
             return False
     
     @staticmethod
-    async def get_hcaptcha_sitekey(page):
-        """Extract HCaptcha sitekey from the page"""
+    async def get_hcaptcha_sitekey(page, frame=None):
+        """Enhanced sitekey extraction"""
+        context = frame or page
+        
         try:
-            element = await page.query_selector('[data-sitekey]')
+            # Method 1: Direct attribute
+            element = await context.query_selector('[data-sitekey]')
             if element:
                 sitekey = await element.get_attribute('data-sitekey')
                 if sitekey:
+                    print(f"[CAPTCHA] Sitekey from attribute: {sitekey}")
                     return sitekey
             
-            iframe = await page.query_selector('iframe[src*="hcaptcha.com"]')
+            # Method 2: From iframe URL
+            iframe = await context.query_selector('iframe[src*="hcaptcha.com"]')
             if iframe:
                 src = await iframe.get_attribute('src')
                 match = re.search(r'sitekey=([a-zA-Z0-9-]+)', src)
                 if match:
-                    return match.group(1)
+                    sitekey = match.group(1)
+                    print(f"[CAPTCHA] Sitekey from iframe: {sitekey}")
+                    return sitekey
             
-            scripts = await page.query_selector_all('script')
-            for script in scripts:
-                content = await script.inner_text()
-                match = re.search(r'["\']sitekey["\']\s*:\s*["\']([a-zA-Z0-9-]+)["\']', content)
-                if match:
-                    return match.group(1)
-                    
+            # Method 3: From JavaScript
+            try:
+                sitekey = await context.evaluate('''
+                    () => {
+                        // Check window object
+                        if (window.hcaptchaSitekey) return window.hcaptchaSitekey;
+                        if (window.hcaptcha && window.hcaptcha.sitekey) return window.hcaptcha.sitekey;
+                        
+                        // Check all scripts
+                        const scripts = document.scripts;
+                        for (let script of scripts) {
+                            const match = script.textContent.match(/sitekey['":\s]+['"]([a-zA-Z0-9-]+)['"]/);
+                            if (match) return match[1];
+                        }
+                        
+                        return null;
+                    }
+                ''')
+                if sitekey:
+                    print(f"[CAPTCHA] Sitekey from JS: {sitekey}")
+                    return sitekey
+            except:
+                pass
+            
             print("[CAPTCHA] Could not find sitekey")
             return None
             
@@ -154,54 +205,92 @@ class CaptchaHandler:
             return None
     
     @staticmethod
-    async def inject_captcha_token(page, token):
-        """Inject the solved captcha token into the page"""
+    async def inject_captcha_token(page, token, frame=None):
+        """Enhanced token injection"""
+        context = frame or page
+        
         try:
-            await page.evaluate(f'''
-                () => {{
-                    const responseField = document.querySelector('[name="h-captcha-response"]');
-                    if (responseField) {{
-                        responseField.value = '{token}';
-                        responseField.innerHTML = '{token}';
-                    }}
+            # Comprehensive injection script
+            injection_result = await context.evaluate(f'''
+                (token) => {{
+                    let injected = false;
                     
-                    const gResponseField = document.querySelector('[name="g-recaptcha-response"]');
-                    if (gResponseField) {{
-                        gResponseField.value = '{token}';
-                        gResponseField.innerHTML = '{token}';
-                    }}
+                    // Standard fields
+                    const responseFields = [
+                        '[name="h-captcha-response"]',
+                        '[name="g-recaptcha-response"]',
+                        'textarea[id*="captcha-response"]'
+                    ];
                     
-                    if (typeof hcaptcha !== 'undefined' && hcaptcha.execute) {{
-                        window.hcaptcha.execute();
-                    }}
-                    
-                    if (window.hcaptchaCallback) {{
-                        window.hcaptchaCallback('{token}');
-                    }}
-                    
-                    if (window.onHcaptchaCallback) {{
-                        window.onHcaptchaCallback('{token}');
-                    }}
-                }}
-            ''')
-            
-            await page.evaluate(f'''
-                () => {{
-                    const event = new CustomEvent('hcaptcha-verified', {{
-                        detail: {{ response: '{token}' }}
+                    responseFields.forEach(selector => {{
+                        const field = document.querySelector(selector);
+                        if (field) {{
+                            field.value = token;
+                            field.innerHTML = token;
+                            injected = true;
+                        }}
                     }});
-                    document.dispatchEvent(event);
+                    
+                    // Trigger callbacks
+                    const callbacks = [
+                        'hcaptchaCallback',
+                        'onHcaptchaCallback',
+                        'captchaCallback',
+                        'onCaptchaSuccess'
+                    ];
+                    
+                    callbacks.forEach(cb => {{
+                        if (typeof window[cb] === 'function') {{
+                            window[cb](token);
+                            injected = true;
+                        }}
+                    }});
+                    
+                    // Trigger hcaptcha object
+                    if (typeof window.hcaptcha !== 'undefined') {{
+                        if (window.hcaptcha.execute) {{
+                            window.hcaptcha.execute();
+                        }}
+                        injected = true;
+                    }}
+                    
+                    // Dispatch events
+                    const events = ['hcaptcha-verified', 'captcha-solved'];
+                    events.forEach(eventName => {{
+                        const event = new CustomEvent(eventName, {{
+                            detail: {{ response: token }},
+                            bubbles: true,
+                            cancelable: true
+                        }});
+                        document.dispatchEvent(event);
+                    }});
+                    
+                    // Check for form submission
+                    const forms = document.querySelectorAll('form');
+                    forms.forEach(form => {{
+                        const hiddenInput = form.querySelector('input[type="hidden"][name*="captcha"]');
+                        if (hiddenInput) {{
+                            hiddenInput.value = token;
+                            injected = true;
+                        }}
+                    }});
+                    
+                    return injected;
                 }}
-            ''')
+            ''', token)
             
-            print("[CAPTCHA] ✓ Token injected")
+            if injection_result:
+                print("[CAPTCHA] ✓ Token injected successfully")
+            else:
+                print("[CAPTCHA] Token injection may have failed")
+                
             return True
             
         except Exception as e:
             print(f"[CAPTCHA] Injection error: {e}")
             return False
 
-# Enhanced Universal Response Analyzer with Request Body Parsing
+# Enhanced Response Analyzer
 class UniversalResponseAnalyzer:
     @staticmethod
     def parse_request_body(body_data, content_type):
@@ -210,22 +299,13 @@ class UniversalResponseAnalyzer:
             return None
             
         try:
-            # JSON content
             if 'application/json' in content_type:
                 return json.loads(body_data)
-            
-            # Form data
             elif 'application/x-www-form-urlencoded' in content_type:
                 parsed = parse_qs(body_data)
-                # Convert single-item lists to strings for readability
                 return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-            
-            # Multipart form data
             elif 'multipart/form-data' in content_type:
-                # Basic parsing - could be enhanced
                 return {"raw": body_data[:500], "type": "multipart"}
-            
-            # Text or other
             else:
                 return body_data[:1000] if len(body_data) > 1000 else body_data
                 
@@ -234,15 +314,13 @@ class UniversalResponseAnalyzer:
     
     @staticmethod
     def analyze_request(url, method, headers, body_text, result_dict):
-        """Analyze outgoing API request"""
+        """Enhanced request analysis"""
         domain = url.split('/')[2] if '/' in url else url
         endpoint = url.split('?')[0] if '?' in url else url
         
-        # Parse request body
         content_type = headers.get('content-type', '') if headers else ''
         parsed_body = UniversalResponseAnalyzer.parse_request_body(body_text, content_type)
         
-        # Store request data
         request_data = {
             "type": "request",
             "url": url,
@@ -257,11 +335,14 @@ class UniversalResponseAnalyzer:
         
         result_dict["raw_api_calls"].append(request_data)
         
-        # Log important requests with body
-        is_payment_api = any(term in url.lower() for term in [
+        # Identify payment-related requests
+        payment_keywords = [
             'stripe', 'payment', 'checkout', 'charge', 'token', 
-            'card', 'pay', 'billing', 'purchase', 'transaction', 'order'
-        ])
+            'card', 'pay', 'billing', 'purchase', 'transaction', 
+            'order', 'square', 'paypal', 'braintree', 'authorize'
+        ]
+        
+        is_payment_api = any(kw in url.lower() for kw in payment_keywords)
         
         if is_payment_api or method in ['POST', 'PUT', 'PATCH']:
             print(f"\n[API-REQUEST-{method}] {domain}")
@@ -270,20 +351,23 @@ class UniversalResponseAnalyzer:
                 body_str = json.dumps(parsed_body) if isinstance(parsed_body, dict) else str(parsed_body)
                 print(f"  BODY: {body_str[:300]}...")
                 
-                # Log specific important fields if present
+                # Extract important fields
                 if isinstance(parsed_body, dict):
-                    important_fields = ['card', 'number', 'email', 'amount', 'currency', 'payment_method', 'client_secret']
+                    important_fields = [
+                        'card', 'number', 'email', 'amount', 'currency',
+                        'payment_method', 'client_secret', 'token', 'source'
+                    ]
                     for field in important_fields:
                         if field in parsed_body:
+                            result_dict[f"extracted_{field}"] = str(parsed_body[field])[:100]
                             print(f"    {field}: {str(parsed_body[field])[:100]}")
     
     @staticmethod
     def analyze_response(url, status, headers, body_text, result_dict):
-        """Analyze incoming API response"""
+        """Enhanced response analysis"""
         domain = url.split('/')[2] if '/' in url else url
         endpoint = url.split('?')[0] if '?' in url else url
         
-        # Log everything
         response_data = {
             "type": "response",
             "url": url,
@@ -295,7 +379,7 @@ class UniversalResponseAnalyzer:
             "size": len(body_text) if body_text else 0
         }
         
-        # Try to parse as JSON
+        # Try to parse response
         try:
             data = json.loads(body_text)
             response_data["data"] = data
@@ -304,39 +388,26 @@ class UniversalResponseAnalyzer:
             response_data["data"] = body_text[:1000] if body_text else ""
             response_data["content_type"] = "text"
         
-        # Store in raw responses
         result_dict["raw_api_calls"].append(response_data)
         
-        # Log based on importance
-        is_payment_api = any(term in url.lower() for term in [
-            'stripe', 'payment', 'checkout', 'charge', 'token', 
-            'card', 'pay', 'billing', 'purchase', 'transaction'
-        ])
-        
-        if is_payment_api:
-            print(f"\n[API-RESPONSE-{status}] {domain}")
-            print(f"  URL: {endpoint[:80]}...")
-            if response_data["content_type"] == "json":
-                print(f"  BODY: {json.dumps(data)[:300]}...")
-        elif status >= 400:
-            print(f"[API-ERROR-{status}] {domain} -> {endpoint[:50]}...")
-        
-        # Analyze for payment success (works for any payment processor)
+        # Analyze payment status
         if response_data["content_type"] == "json":
             data = response_data["data"]
             
-            # Generic success indicators
+            # Check for success
             success_indicators = [
-                data.get('status') in ['succeeded', 'success', 'complete', 'paid', 'approved'],
-                data.get('result') in ['success', 'approved'],
+                data.get('status') in ['succeeded', 'success', 'complete', 'paid', 'approved', 'captured'],
+                data.get('result') in ['success', 'approved', 'authorized'],
                 data.get('payment_status') in ['paid', 'complete', 'success'],
-                data.get('transaction_status') in ['approved', 'success'],
+                data.get('state') in ['approved', 'completed', 'captured'],
+                data.get('captured') == True,
                 data.get('approved') == True,
                 data.get('paid') == True,
                 data.get('success') == True,
                 'success_url' in data,
                 'confirmation' in data,
-                'receipt' in data
+                'receipt' in data,
+                'order_id' in data and data.get('status') != 'failed'
             ]
             
             if any(success_indicators):
@@ -344,35 +415,261 @@ class UniversalResponseAnalyzer:
                 result_dict["success"] = True
                 result_dict["message"] = f"Payment confirmed via {domain}"
                 print(f"[✓✓✓ PAYMENT CONFIRMED] {domain} - {data.get('status', 'success')}")
+                
+                # Extract transaction details
+                if 'id' in data:
+                    result_dict["transaction_id"] = data['id']
+                if 'amount' in data:
+                    result_dict["amount"] = data['amount']
             
             # Check for errors
-            error_fields = ['error', 'error_message', 'message', 'decline_reason', 'failure_reason']
-            for field in error_fields:
-                if field in data and data[field]:
-                    result_dict["error"] = str(data[field])
+            error_indicators = [
+                data.get('error'),
+                data.get('error_message'),
+                data.get('decline_code'),
+                data.get('failure_reason'),
+                data.get('status') in ['failed', 'declined', 'error', 'cancelled']
+            ]
+            
+            for indicator in error_indicators:
+                if indicator:
+                    result_dict["error"] = str(indicator) if not isinstance(indicator, bool) else "Payment failed"
                     result_dict["success"] = False
-                    print(f"[ERROR] {field}: {data[field]}")
+                    print(f"[ERROR] {result_dict['error']}")
                     break
             
             # 3DS detection
-            if any(term in str(data).lower() for term in ['3d', 'authentication', 'verify', 'challenge']):
+            three_ds_indicators = [
+                'three_d_secure' in str(data).lower(),
+                'authentication' in str(data).lower(),
+                'requires_action' in data,
+                'next_action' in data,
+                'redirect_to_url' in data
+            ]
+            
+            if any(three_ds_indicators):
                 result_dict["requires_3ds"] = True
                 print("[3DS] Authentication required")
 
-def rate_limit_check():
-    now = time.time()
-    while request_timestamps and request_timestamps[0] < now - CONFIG["RATE_LIMIT_WINDOW"]:
-        request_timestamps.popleft()
+# Enhanced frame management
+class FrameManager:
+    @staticmethod
+    async def get_all_frames(page, max_depth=3):
+        """Recursively get all frames including nested ones"""
+        all_frames = []
+        
+        async def collect_frames(frame, depth=0):
+            if depth > max_depth:
+                return
+            all_frames.append(frame)
+            for child in frame.child_frames:
+                await collect_frames(child, depth + 1)
+        
+        await collect_frames(page.main_frame)
+        return all_frames
     
-    if len(request_timestamps) >= CONFIG["RATE_LIMIT_REQUESTS"]:
-        oldest = request_timestamps[0]
-        wait_time = CONFIG["RATE_LIMIT_WINDOW"] - (now - oldest)
-        return False, wait_time
-    
-    request_timestamps.append(now)
-    return True, 0
+    @staticmethod
+    async def find_payment_frames(all_frames):
+        """Identify frames likely to contain payment elements"""
+        payment_frames = []
+        payment_domains = [
+            'stripe', 'checkout', 'payment', 'pay', 
+            'square', 'paypal', 'braintree', 'authorize'
+        ]
+        
+        for frame in all_frames:
+            try:
+                frame_url = frame.url.lower()
+                if any(domain in frame_url for domain in payment_domains):
+                    payment_frames.append(frame)
+                    print(f"[FRAME] Payment frame: {frame.url[:80]}")
+            except:
+                continue
+                
+        return payment_frames
 
-# Card utilities (keeping existing functions)
+# Form filling utilities
+class FormFiller:
+    @staticmethod
+    async def fill_element_safely(element, value, typing_delay=None):
+        """Safely fill an element with error handling"""
+        try:
+            if not await element.is_visible():
+                return False
+                
+            await element.scroll_into_view_if_needed()
+            await element.click()
+            await asyncio.sleep(0.1)
+            
+            # Clear existing value
+            await element.evaluate('el => el.value = ""')
+            
+            # Type new value
+            if typing_delay:
+                for char in str(value):
+                    await element.type(char, delay=typing_delay)
+            else:
+                await element.fill(str(value))
+                
+            return True
+            
+        except Exception as e:
+            print(f"[FILL] Error: {e}")
+            return False
+    
+    @staticmethod
+    async def fill_card_fields(context, card, filled_status):
+        """Fill card fields in a given context (page or frame)"""
+        typing_delay = 20 if CONFIG['FAST_MODE'] else random.randint(30, 80)
+        
+        # Card number
+        if not filled_status["card"]:
+            card_selectors = [
+                'input[placeholder*="1234" i]',
+                'input[placeholder*="card" i]:not([placeholder*="holder"])',
+                'input[name*="card" i]:not([name*="holder"])',
+                'input[autocomplete="cc-number"]',
+                'input[data-elements-stable-field-name="cardNumber"]',
+                'input[id*="card-number" i]',
+                'input[id*="cardnumber" i]',
+                '#cardNumber'
+            ]
+            
+            for selector in card_selectors:
+                try:
+                    elements = await context.query_selector_all(selector)
+                    for element in elements:
+                        if await FormFiller.fill_element_safely(element, card['number'], typing_delay):
+                            filled_status["card"] = True
+                            print(f"[CARD] ✓ {card['number']}")
+                            break
+                    if filled_status["card"]:
+                        break
+                except:
+                    continue
+        
+        # Expiry
+        if not filled_status["expiry"]:
+            exp_string = f"{card['month']}/{card['year'][-2:]}"
+            expiry_selectors = [
+                'input[placeholder*="mm" i]',
+                'input[placeholder*="exp" i]',
+                'input[name*="exp" i]:not([name*="year"]):not([name*="month"])',
+                'input[autocomplete="cc-exp"]',
+                'input[data-elements-stable-field-name="cardExpiry"]',
+                'input[id*="expiry" i]',
+                '#cardExpiry'
+            ]
+            
+            for selector in expiry_selectors:
+                try:
+                    elements = await context.query_selector_all(selector)
+                    for element in elements:
+                        if await FormFiller.fill_element_safely(element, exp_string, typing_delay):
+                            filled_status["expiry"] = True
+                            print(f"[EXPIRY] ✓ {exp_string}")
+                            break
+                    if filled_status["expiry"]:
+                        break
+                except:
+                    continue
+        
+        # CVC/CVV
+        if not filled_status["cvc"]:
+            cvc_selectors = [
+                'input[placeholder*="cvc" i]',
+                'input[placeholder*="cvv" i]',
+                'input[placeholder*="security" i]',
+                'input[name*="cvc" i]',
+                'input[name*="cvv" i]',
+                'input[autocomplete="cc-csc"]',
+                'input[data-elements-stable-field-name="cardCvc"]',
+                'input[id*="cvc" i]',
+                'input[id*="cvv" i]',
+                '#cardCvc'
+            ]
+            
+            for selector in cvc_selectors:
+                try:
+                    elements = await context.query_selector_all(selector)
+                    for element in elements:
+                        if await FormFiller.fill_element_safely(element, card['cvv'], typing_delay):
+                            filled_status["cvc"] = True
+                            print(f"[CVC] ✓ {card['cvv']}")
+                            break
+                    if filled_status["cvc"]:
+                        break
+                except:
+                    continue
+        
+        return filled_status
+
+# Enhanced wait utilities
+async def smart_wait(page, base_ms=1000):
+    """Intelligent waiting based on page state"""
+    try:
+        # Wait for basic stability
+        await page.wait_for_timeout(base_ms)
+        
+        # Check for active animations
+        animations_done = await page.evaluate('''
+            () => {
+                const animations = document.getAnimations();
+                return animations.length === 0 || animations.every(a => a.playState !== 'running');
+            }
+        ''')
+        
+        if not animations_done:
+            await page.wait_for_timeout(500)
+            
+        # Wait for network idle
+        try:
+            await page.wait_for_load_state('networkidle', timeout=CONFIG['NETWORK_IDLE_TIMEOUT'])
+        except:
+            pass
+            
+        return True
+        
+    except:
+        return False
+
+async def wait_for_payment_elements(page, timeout=10000):
+    """Wait for payment elements to appear"""
+    start = time.time()
+    
+    while (time.time() - start) * 1000 < timeout:
+        try:
+            # Check for various payment indicators
+            payment_ready = await page.evaluate('''
+                () => {
+                    // Stripe
+                    if (window.Stripe && document.querySelector('.StripeElement')) return true;
+                    
+                    // Generic payment forms
+                    const cardInputs = document.querySelectorAll('input[placeholder*="card" i], input[name*="card" i]');
+                    if (cardInputs.length > 0) return true;
+                    
+                    // iframes
+                    const frames = document.querySelectorAll('iframe[src*="stripe"], iframe[src*="checkout"]');
+                    if (frames.length > 0) return true;
+                    
+                    return false;
+                }
+            ''')
+            
+            if payment_ready:
+                print("[WAIT] Payment elements ready")
+                return True
+                
+        except:
+            pass
+            
+        await asyncio.sleep(0.5)
+    
+    print("[WAIT] Timeout waiting for payment elements")
+    return False
+
+# Card utilities (unchanged from original)
 def luhn_algorithm(number_str):
     total = 0
     reverse_digits = number_str[::-1]
@@ -451,21 +748,20 @@ def generate_random_name():
     last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez']
     return f"{random.choice(first_names)} {random.choice(last_names)}"
 
-async def safe_wait(page, ms):
-    try:
-        await page.wait_for_timeout(ms)
-        return True
-    except:
-        return False
+def rate_limit_check():
+    now = time.time()
+    while request_timestamps and request_timestamps[0] < now - CONFIG["RATE_LIMIT_WINDOW"]:
+        request_timestamps.popleft()
+    
+    if len(request_timestamps) >= CONFIG["RATE_LIMIT_REQUESTS"]:
+        oldest = request_timestamps[0]
+        wait_time = CONFIG["RATE_LIMIT_WINDOW"] - (now - oldest)
+        return False, wait_time
+    
+    request_timestamps.append(now)
+    return True, 0
 
-async def wait_for_network_idle(page, timeout=5000):
-    """Wait for network to be idle"""
-    try:
-        await page.wait_for_load_state('networkidle', timeout=timeout)
-        return True
-    except:
-        return False
-
+# Main automation function with enhanced error handling
 async def run_stripe_automation(url, cc_string, email=None):
     card = process_card_input(cc_string)
     if not card:
@@ -479,12 +775,11 @@ async def run_stripe_automation(url, cc_string, email=None):
     print(f"[CARD] {card['number']} | {card['month']}/{card['year']} | {card['cvv']}")
     print(f"[EMAIL] {email}")
     print(f"[MODE] {'FAST' if CONFIG['FAST_MODE'] else 'NORMAL'}")
-    print(f"[REQUEST BODY LOGGING] {'ON' if CONFIG['LOG_REQUEST_BODIES'] else 'OFF'}")
     print('='*80)
     
     stripe_result = {
         "status": "pending",
-        "raw_api_calls": [],  # Combined requests and responses
+        "raw_api_calls": [],
         "payment_confirmed": False,
         "token_created": False,
         "payment_method_created": False,
@@ -493,21 +788,24 @@ async def run_stripe_automation(url, cc_string, email=None):
         "requires_3ds": False,
         "captcha_solved": False,
         "network_requests": 0,
-        "network_errors": 0
+        "network_errors": 0,
+        "frames_checked": 0,
+        "elements_filled": {}
     }
     
     analyzer = UniversalResponseAnalyzer()
     captcha_handler = CaptchaHandler()
     captcha_solver = TwoCaptchaSolver(CONFIG.get("TWOCAPTCHA_API_KEY"))
+    frame_manager = FrameManager()
+    form_filler = FormFiller()
     
-    async with async_playwright() as p:
-        browser = None
-        context = None
-        page = None
-        payment_submitted = False
-        
-        try:
-            # Browser setup with full capabilities
+    browser = None
+    context = None
+    page = None
+    
+    try:
+        async with async_playwright() as p:
+            # Enhanced browser setup
             browser_args = [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -517,27 +815,39 @@ async def run_stripe_automation(url, cc_string, email=None):
                 '--disable-features=IsolateOrigins,site-per-process',
                 '--allow-running-insecure-content',
                 '--disable-popup-blocking',
-                '--disable-content-security-policy'
+                '--disable-content-security-policy',
+                '--ignore-certificate-errors',
+                '--ignore-certificate-errors-spki-list'
             ]
             
-            if CONFIG["RUN_LOCAL"]:
-                browser = await p.chromium.launch(
-                    headless=False, 
-                    slow_mo=50 if CONFIG['FAST_MODE'] else 100,
-                    args=browser_args
-                )
-                print("[BROWSER] Local")
-            else:
-                print("[BROWSER] Connecting to Browserless...")
-                browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
+            # Browser connection with retry
+            max_browser_retries = 3
+            for attempt in range(max_browser_retries):
                 try:
-                    browser = await p.chromium.connect(browser_url, timeout=30000)
-                    print("[BROWSER] ✓ Connected")
+                    if CONFIG["RUN_LOCAL"]:
+                        browser = await p.chromium.launch(
+                            headless=False, 
+                            slow_mo=50 if CONFIG['FAST_MODE'] else 100,
+                            args=browser_args
+                        )
+                        print("[BROWSER] Local mode")
+                        break
+                    else:
+                        print(f"[BROWSER] Connecting to Browserless (attempt {attempt + 1})...")
+                        browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
+                        browser = await p.chromium.connect(browser_url, timeout=30000)
+                        print("[BROWSER] ✓ Connected")
+                        break
                 except Exception as e:
-                    print(f"[BROWSER] Failed: {e}")
-                    browser = await p.chromium.launch(headless=True, args=browser_args)
+                    print(f"[BROWSER] Connection failed: {e}")
+                    if attempt == max_browser_retries - 1:
+                        # Fallback to local
+                        browser = await p.chromium.launch(headless=True, args=browser_args)
+                        print("[BROWSER] Fallback to local headless")
+                    else:
+                        await asyncio.sleep(2)
             
-            # Enhanced context with all permissions
+            # Enhanced context setup
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -546,27 +856,24 @@ async def run_stripe_automation(url, cc_string, email=None):
                 ignore_https_errors=True,
                 bypass_csp=True,
                 java_script_enabled=True,
-                permissions=['geolocation', 'notifications', 'camera', 'microphone'],
+                permissions=['geolocation', 'notifications', 'camera', 'microphone', 'clipboard-read', 'clipboard-write'],
                 extra_http_headers={
                     'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept': '*/*',
-                    'Accept-Encoding': 'gzip, deflate, br'
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache'
                 }
             )
             
-            # Add comprehensive stealth scripts
+            # Advanced stealth scripts
             await context.add_init_script("""
-                // Remove webdriver flag
+                // Stealth mode
                 Object.defineProperty(navigator, 'webdriver', {
-                    get: () => false,
+                    get: () => undefined
                 });
                 
-                // Add plugins
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-                
-                // Chrome specific
+                // Chrome runtime
                 window.chrome = {
                     runtime: {},
                     loadTimes: function() {},
@@ -574,130 +881,129 @@ async def run_stripe_automation(url, cc_string, email=None):
                     app: {}
                 };
                 
-                // Permission overrides
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
+                // Notification permission
+                Object.defineProperty(navigator, 'permissions', {
+                    get: () => ({
+                        query: () => Promise.resolve({ state: 'granted' })
+                    })
+                });
                 
-                // Ensure all iframes load properly
+                // WebGL vendor
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                    if (parameter === 37445) {
+                        return 'Intel Inc.';
+                    }
+                    if (parameter === 37446) {
+                        return 'Intel Iris OpenGL Engine';
+                    }
+                    return getParameter(parameter);
+                };
+                
+                // Frame communication
                 window.addEventListener('message', function(e) {
-                    console.log('Frame message:', e.origin, e.data);
+                    if (e.data && e.data.type === 'stripe-frame-ready') {
+                        console.log('Stripe frame ready');
+                    }
                 }, false);
             """)
             
             page = await context.new_page()
             
-            # Comprehensive network interception for ALL requests
+            # Network monitoring setup
+            request_counter = {"count": 0}
+            
             async def capture_request(request):
                 try:
-                    stripe_result["network_requests"] += 1
+                    request_counter["count"] += 1
+                    stripe_result["network_requests"] = request_counter["count"]
+                    
                     url = request.url
                     method = request.method
-                    headers = request.headers
+                    headers = await request.all_headers()
                     
-                    # Capture request body if available
+                    # Capture POST data
                     body_text = None
-                    try:
-                        if method in ['POST', 'PUT', 'PATCH']:
+                    if method in ['POST', 'PUT', 'PATCH']:
+                        try:
                             body = request.post_data
                             if body:
                                 body_text = body
-                                # Analyze the request
                                 analyzer.analyze_request(url, method, headers, body_text, stripe_result)
-                    except:
-                        pass
+                        except:
+                            pass
                     
-                    # Log important requests even without body
-                    if not body_text and (method in ['POST', 'PUT', 'PATCH'] or 'api' in url.lower()):
+                    # Log important requests
+                    if 'api' in url.lower() or 'payment' in url.lower():
                         print(f"[REQUEST-{method}] {url[:80]}...")
                         
                 except Exception as e:
-                    print(f"[REQUEST-ERROR] {e}")
+                    print(f"[REQUEST-ERROR] {str(e)[:100]}")
             
             async def capture_response(response):
                 try:
                     url = response.url
                     status = response.status
-                    headers = response.headers
+                    headers = await response.all_headers()
                     
-                    # Capture ALL responses, not just JSON
+                    # Capture response body
                     try:
-                        content_type = headers.get('content-type', '')
                         body = await response.body()
                         text = body.decode('utf-8', errors='ignore') if body else ""
-                        
-                        # Analyze everything
                         analyzer.analyze_response(url, status, headers, text, stripe_result)
-                        
-                    except Exception as e:
-                        # Still log even if we can't get body
+                    except:
                         analyzer.analyze_response(url, status, headers, "", stripe_result)
                         
                 except Exception as e:
                     stripe_result["network_errors"] += 1
+                    print(f"[RESPONSE-ERROR] {str(e)[:100]}")
             
             async def capture_request_failed(request):
                 stripe_result["network_errors"] += 1
-                print(f"[REQUEST-FAILED] {request.url[:80]}... - {request.failure}")
+                print(f"[FAILED] {request.url[:50]}... - {request.failure}")
             
-            # Attach all network handlers
+            # Attach handlers
             page.on("request", capture_request)
             page.on("response", capture_response)
             page.on("requestfailed", capture_request_failed)
+            page.on("console", lambda msg: None)  # Suppress console logs for cleaner output
+            page.on("pageerror", lambda error: print(f"[PAGE-ERROR] {str(error)[:100]}"))
             
-            # Route interception for deeper request body capture
-            await page.route('**/*', lambda route, request: route.continue_())
-            
-            # Console logging for JS errors/info
-            page.on("console", lambda msg: print(f"[CONSOLE-{msg.type}] {msg.text[:200]}") if msg.type in ['error', 'warning'] else None)
-            page.on("pageerror", lambda error: print(f"[PAGE-ERROR] {error}"))
-            
-            # Navigate with full loading
+            # Navigate with full rendering
             print("[NAV] Loading page...")
-            await page.goto(url, wait_until="networkidle", timeout=40000)
-            print("[NAV] ✓ Page loaded")
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                if response:
+                    print(f"[NAV] Response status: {response.status}")
+            except PlaywrightTimeout:
+                print("[NAV] Initial load timeout, continuing...")
             
-            # Wait for all dynamic content
-            await wait_for_network_idle(page, 5000)
+            # Wait for full render
+            print("[RENDER] Waiting for page to render...")
+            await smart_wait(page, CONFIG['RENDER_WAIT'])
             
-            # Ensure all frames are loaded
-            frames = page.frames
-            print(f"[FRAMES] Total frames: {len(frames)}")
-            for idx, frame in enumerate(frames):
-                try:
-                    frame_url = frame.url
-                    if frame_url and frame_url != 'about:blank':
-                        print(f"[FRAME-{idx}] {frame_url[:80]}...")
-                except:
-                    pass
+            # Wait for payment elements
+            await wait_for_payment_elements(page)
             
-            # Wait for any lazy-loaded content
-            await safe_wait(page, 2000 if CONFIG['FAST_MODE'] else 3000)
+            # Get all frames
+            all_frames = await frame_manager.get_all_frames(page)
+            payment_frames = await frame_manager.find_payment_frames(all_frames)
+            stripe_result["frames_checked"] = len(all_frames)
+            print(f"[FRAMES] {len(all_frames)} total, {len(payment_frames)} payment frames")
             
-            print(f"[NETWORK] {stripe_result['network_requests']} requests captured so far")
-            print(f"[API CALLS] {len(stripe_result['raw_api_calls'])} API calls logged")
-            
-            # Check for HCaptcha
-            has_captcha = await captcha_handler.detect_hcaptcha(page)
+            # Check for captcha
+            has_captcha = await captcha_handler.detect_captcha(page)
             if has_captcha:
-                print("[CAPTCHA] HCaptcha detected on page")
                 sitekey = await captcha_handler.get_hcaptcha_sitekey(page)
-                
                 if sitekey and CONFIG.get("TWOCAPTCHA_API_KEY"):
-                    print(f"[CAPTCHA] Sitekey found: {sitekey}")
                     token = await captcha_solver.solve_hcaptcha(sitekey, page.url)
-                    
                     if token:
                         await captcha_handler.inject_captcha_token(page, token)
                         stripe_result["captcha_solved"] = True
-                        await safe_wait(page, 1000 if CONFIG['FAST_MODE'] else 2000)
-                        print("[CAPTCHA] ✓ Solved and injected")
+                        await smart_wait(page, 2000)
             
-            # Fill email with multiple strategies
-            print("[FILL] Email...")
+            # Fill email first
+            print("[FILL] Starting form filling...")
             email_filled = False
             email_selectors = [
                 'input[type="email"]',
@@ -705,7 +1011,8 @@ async def run_stripe_automation(url, cc_string, email=None):
                 '#email',
                 'input[placeholder*="email" i]',
                 'input[id*="email" i]',
-                'input[autocomplete="email"]'
+                'input[autocomplete="email"]',
+                'input[aria-label*="email" i]'
             ]
             
             for selector in email_selectors:
@@ -715,197 +1022,105 @@ async def run_stripe_automation(url, cc_string, email=None):
                     elements = await page.query_selector_all(selector)
                     for element in elements:
                         if await element.is_visible():
-                            await element.scroll_into_view_if_needed()
-                            await element.click()
-                            await element.fill("")
-                            await element.type(email, delay=20 if CONFIG['FAST_MODE'] else 50)
-                            email_filled = True
-                            print(f"[EMAIL] ✓ {email}")
-                            break
+                            if await form_filler.fill_element_safely(element, email):
+                                email_filled = True
+                                stripe_result["elements_filled"]["email"] = True
+                                print(f"[EMAIL] ✓ {email}")
+                                break
                 except:
                     continue
             
-            await safe_wait(page, 500 if CONFIG['FAST_MODE'] else 1500)
-            
-            # Enhanced card filling with all frames
-            print("[FILL] Card details...")
-            filled_status = {"card": False, "expiry": False, "cvc": False, "name": False}
-            
             # Fill name
-            try:
-                name_selectors = [
-                    'input[name*="name" i]:not([name*="email"])',
-                    'input[placeholder*="name" i]:not([placeholder*="email"])',
-                    '#cardholder-name',
-                    'input[autocomplete*="name"]'
-                ]
-                for selector in name_selectors:
-                    if filled_status["name"]:
-                        break
+            name_filled = False
+            name_selectors = [
+                'input[name*="name" i]:not([name*="email"])',
+                'input[placeholder*="name" i]:not([placeholder*="email"])',
+                '#cardholder-name',
+                'input[autocomplete*="name"]',
+                'input[aria-label*="name" i]'
+            ]
+            
+            for selector in name_selectors:
+                if name_filled:
+                    break
+                try:
                     elements = await page.query_selector_all(selector)
                     for element in elements:
                         if await element.is_visible():
-                            await element.click()
-                            await element.fill(random_name)
-                            filled_status["name"] = True
-                            print(f"[NAME] ✓ {random_name}")
-                            break
-            except:
-                pass
+                            if await form_filler.fill_element_safely(element, random_name):
+                                name_filled = True
+                                stripe_result["elements_filled"]["name"] = True
+                                print(f"[NAME] ✓ {random_name}")
+                                break
+                except:
+                    continue
             
-            # Get all frames including nested
-            all_frames = []
-            def collect_frames(frame):
-                all_frames.append(frame)
-                for child in frame.child_frames:
-                    collect_frames(child)
+            # Fill card details with retries
+            filled_status = {"card": False, "expiry": False, "cvc": False}
             
-            collect_frames(page.main_frame)
-            stripe_frames = [f for f in all_frames if 'stripe' in f.url.lower() or 'checkout' in f.url.lower()]
-            
-            print(f"[FRAMES] {len(all_frames)} total, {len(stripe_frames)} payment frames")
-            
-            # Try filling in all relevant frames
-            for attempt in range(2):  # Reduced attempts for speed
-                if all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
+            for retry in range(CONFIG['MAX_FRAME_RETRIES']):
+                if all(filled_status.values()):
                     break
                     
-                print(f"[FILL] Card attempt {attempt + 1}")
+                print(f"[FILL] Card details attempt {retry + 1}/{CONFIG['MAX_FRAME_RETRIES']}")
                 
                 # Try main page first
-                frames_to_check = [page] + stripe_frames
+                await form_filler.fill_card_fields(page, card, filled_status)
                 
-                for frame_or_page in frames_to_check:
+                # Then try each payment frame
+                for frame in payment_frames:
+                    if all(filled_status.values()):
+                        break
                     try:
-                        # Card number
-                        if not filled_status["card"]:
-                            card_selectors = [
-                                'input[placeholder*="1234" i]',
-                                'input[placeholder*="card" i]',
-                                'input[name*="card" i]',
-                                'input[autocomplete="cc-number"]',
-                                'input[data-elements-stable-field-name="cardNumber"]',
-                                '#cardNumber'
-                            ]
-                            for selector in card_selectors:
-                                try:
-                                    element = await frame_or_page.query_selector(selector)
-                                    if element and await element.is_visible():
-                                        await element.scroll_into_view_if_needed()
-                                        await element.click()
-                                        await element.fill("")
-                                        typing_delay = 20 if CONFIG['FAST_MODE'] else random.randint(30, 80)
-                                        for digit in card['number']:
-                                            await element.type(digit, delay=typing_delay)
-                                        filled_status["card"] = True
-                                        print(f"[CARD] ✓ {card['number']}")
-                                        break
-                                except:
-                                    continue
-                        
-                        # Expiry
-                        if not filled_status["expiry"]:
-                            expiry_selectors = [
-                                'input[placeholder*="mm" i]',
-                                'input[placeholder*="exp" i]',
-                                'input[name*="exp" i]',
-                                'input[autocomplete="cc-exp"]',
-                                'input[data-elements-stable-field-name="cardExpiry"]',
-                                '#cardExpiry'
-                            ]
-                            for selector in expiry_selectors:
-                                try:
-                                    element = await frame_or_page.query_selector(selector)
-                                    if element and await element.is_visible():
-                                        await element.scroll_into_view_if_needed()
-                                        await element.click()
-                                        await element.fill("")
-                                        exp_string = f"{card['month']}/{card['year'][-2:]}"
-                                        typing_delay = 20 if CONFIG['FAST_MODE'] else random.randint(30, 80)
-                                        for char in exp_string:
-                                            await element.type(char, delay=typing_delay)
-                                        filled_status["expiry"] = True
-                                        print(f"[EXPIRY] ✓ {exp_string}")
-                                        break
-                                except:
-                                    continue
-                        
-                        # CVC
-                        if not filled_status["cvc"]:
-                            cvc_selectors = [
-                                'input[placeholder*="cvc" i]',
-                                'input[placeholder*="cvv" i]',
-                                'input[placeholder*="security" i]',
-                                'input[name*="cvc" i]',
-                                'input[name*="cvv" i]',
-                                'input[autocomplete="cc-csc"]',
-                                'input[data-elements-stable-field-name="cardCvc"]',
-                                '#cardCvc'
-                            ]
-                            for selector in cvc_selectors:
-                                try:
-                                    element = await frame_or_page.query_selector(selector)
-                                    if element and await element.is_visible():
-                                        await element.scroll_into_view_if_needed()
-                                        await element.click()
-                                        await element.fill("")
-                                        typing_delay = 20 if CONFIG['FAST_MODE'] else random.randint(30, 80)
-                                        for digit in card['cvv']:
-                                            await element.type(digit, delay=typing_delay)
-                                        filled_status["cvc"] = True
-                                        print(f"[CVC] ✓ {card['cvv']}")
-                                        break
-                                except:
-                                    continue
-                    except Exception as e:
-                        print(f"[FRAME] Error: {str(e)[:100]}")
+                        await form_filler.fill_card_fields(frame, card, filled_status)
+                    except:
                         continue
                 
-                if not all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
-                    await safe_wait(page, 500 if CONFIG['FAST_MODE'] else 1000)
+                if not all(filled_status.values()):
+                    await smart_wait(page, 1000)
             
-            print(f"[STATUS] Filled: {filled_status}")
-            print(f"[NETWORK] {stripe_result['network_requests']} requests captured")
-            print(f"[API CALLS] {len(stripe_result['raw_api_calls'])} API calls logged")
+            stripe_result["elements_filled"].update(filled_status)
+            print(f"[FILLED] Status: {filled_status}")
             
             # Wait for validation
-            await safe_wait(page, 1500 if CONFIG['FAST_MODE'] else 3000)
-            await wait_for_network_idle(page, 3000)
+            await smart_wait(page, 2000)
             
-            # Check for captcha again
-            has_captcha_after = await captcha_handler.detect_hcaptcha(page)
+            # Check for captcha after filling
+            has_captcha_after = await captcha_handler.detect_captcha(page)
             if has_captcha_after and not stripe_result["captcha_solved"]:
-                print("[CAPTCHA] HCaptcha appeared after filling")
                 sitekey = await captcha_handler.get_hcaptcha_sitekey(page)
-                
                 if sitekey and CONFIG.get("TWOCAPTCHA_API_KEY"):
                     token = await captcha_solver.solve_hcaptcha(sitekey, page.url)
                     if token:
                         await captcha_handler.inject_captcha_token(page, token)
                         stripe_result["captcha_solved"] = True
-                        await safe_wait(page, 1000)
+                        await smart_wait(page, 1000)
             
-            # Submit payment with enhanced selectors
+            # Submit payment
             print("[SUBMIT] Looking for submit button...")
+            payment_submitted = False
+            
             submit_selectors = [
                 'button[type="submit"]:visible',
                 'button:has-text("pay"):visible',
                 'button:has-text("submit"):visible',
                 'button:has-text("complete"):visible',
                 'button:has-text("confirm"):visible',
-                'button:has-text("place order"):visible',
+                'button:has-text("place"):visible',
                 'button:has-text("checkout"):visible',
+                'button:has-text("continue"):visible',
                 'button.btn-primary:visible',
                 'button.submit-button:visible',
-                'input[type="submit"]:visible'
+                'input[type="submit"]:visible',
+                '*[role="button"]:has-text("pay"):visible'
             ]
             
             for selector in submit_selectors:
                 try:
                     btn = page.locator(selector).first
                     if await btn.count() > 0:
-                        is_disabled = await btn.get_attribute('disabled')
-                        if is_disabled is None or is_disabled == 'false':
+                        is_disabled = await btn.is_disabled()
+                        if not is_disabled:
                             await btn.scroll_into_view_if_needed()
                             await btn.click()
                             payment_submitted = True
@@ -915,29 +1130,43 @@ async def run_stripe_automation(url, cc_string, email=None):
                     continue
             
             if not payment_submitted:
+                # Try JavaScript click
+                try:
+                    await page.evaluate('''
+                        () => {
+                            const buttons = document.querySelectorAll('button');
+                            for (let btn of buttons) {
+                                const text = btn.textContent.toLowerCase();
+                                if (text.includes('pay') || text.includes('submit') || text.includes('complete')) {
+                                    btn.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+                    ''')
+                    payment_submitted = True
+                    print("[SUBMIT] ✓ JavaScript click")
+                except:
+                    pass
+            
+            if not payment_submitted:
+                # Last resort: Enter key
                 await page.keyboard.press('Enter')
                 payment_submitted = True
                 print("[SUBMIT] ✓ Enter key pressed")
             
-            # Wait for payment processing
-            print(f"[WAIT] Processing payment ({10 if CONFIG['FAST_MODE'] else 15}s)...")
-            await safe_wait(page, 10000 if CONFIG['FAST_MODE'] else 15000)
-            await wait_for_network_idle(page, 5000)
+            stripe_result["elements_filled"]["submitted"] = payment_submitted
             
             # Monitor for response
-            print("[MONITORING] Waiting for confirmation...")
+            print(f"[WAIT] Processing payment...")
             start_time = time.time()
             max_wait = CONFIG["RESPONSE_TIMEOUT_SECONDS"]
-            last_call_count = 0
             
             while time.time() - start_time < max_wait:
-                elapsed = time.time() - start_time
+                elapsed = int(time.time() - start_time)
                 
-                current_calls = len(stripe_result['raw_api_calls'])
-                if current_calls > last_call_count:
-                    print(f"[MONITOR] {current_calls} API calls captured, {stripe_result['network_requests']} total requests")
-                    last_call_count = current_calls
-                
+                # Check for success indicators
                 if stripe_result.get("payment_confirmed"):
                     print("[✓✓✓ SUCCESS] Payment confirmed!")
                     break
@@ -948,71 +1177,94 @@ async def run_stripe_automation(url, cc_string, email=None):
                 
                 if stripe_result.get("requires_3ds"):
                     print("[3DS] Authentication required")
+                    # Try to handle 3DS if possible
+                    try:
+                        three_ds_frame = await page.query_selector('iframe[name*="3ds"], iframe[src*="3ds"]')
+                        if three_ds_frame:
+                            print("[3DS] Frame detected, waiting for user action...")
+                            await smart_wait(page, 5000)
+                    except:
+                        pass
                     break
                 
-                # Check URL for success
+                # Check URL changes
                 try:
                     current_url = page.url
-                    success_url = stripe_result.get("success_url")
-                    
-                    if success_url and current_url.startswith(success_url):
-                        print(f"[✓ SUCCESS] Redirected to: {current_url[:80]}")
+                    success_indicators = ['success', 'thank', 'complete', 'confirmed', 'receipt', 'order']
+                    if any(indicator in current_url.lower() for indicator in success_indicators):
                         stripe_result["payment_confirmed"] = True
                         stripe_result["success"] = True
-                        break
-                    
-                    if any(x in current_url.lower() for x in ['success', 'thank', 'complete', 'confirmed', 'order']):
-                        print(f"[SUCCESS PAGE] {current_url[:80]}")
-                        stripe_result["payment_confirmed"] = True
-                        stripe_result["success"] = True
+                        stripe_result["success_url"] = current_url
+                        print(f"[SUCCESS] Redirected to: {current_url[:80]}")
                         break
                 except:
                     pass
                 
-                # Keep alive
-                if int(elapsed) % 5 == 0 and int(elapsed) > 0:
-                    try:
-                        await page.evaluate('1')
-                    except:
-                        print("[WARNING] Browser disconnected")
+                # Check page content for success
+                try:
+                    success_text = await page.evaluate('''
+                        () => {
+                            const body = document.body.innerText.toLowerCase();
+                            const successWords = ['thank you', 'success', 'confirmed', 'complete', 'receipt'];
+                            return successWords.some(word => body.includes(word));
+                        }
+                    ''')
+                    if success_text:
+                        stripe_result["payment_confirmed"] = True
+                        stripe_result["success"] = True
+                        print("[SUCCESS] Success message detected on page")
                         break
+                except:
+                    pass
+                
+                # Progress indicator
+                if elapsed % 5 == 0 and elapsed > 0:
+                    print(f"[WAIT] {elapsed}s elapsed, {stripe_result['network_requests']} requests captured")
                 
                 await asyncio.sleep(0.5)
             
+            # Final summary
             print(f"\n[SUMMARY]")
-            print(f"  - Total Requests: {stripe_result['network_requests']}")
-            print(f"  - API Calls Captured: {len(stripe_result['raw_api_calls'])}")
-            print(f"  - Network Errors: {stripe_result['network_errors']}")
+            print(f"  - Network Requests: {stripe_result['network_requests']}")
+            print(f"  - API Calls: {len(stripe_result['raw_api_calls'])}")
+            print(f"  - Frames Checked: {stripe_result['frames_checked']}")
+            print(f"  - Elements Filled: {stripe_result['elements_filled']}")
             print(f"  - Captcha: {'Solved' if stripe_result['captcha_solved'] else 'Not required'}")
             
-            # Separate requests and responses for final output
+            # Prepare response
             requests_only = [call for call in stripe_result['raw_api_calls'] if call.get('type') == 'request']
             responses_only = [call for call in stripe_result['raw_api_calls'] if call.get('type') == 'response']
             
-            # Build final response
             base_response = {
                 "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
-                "captcha_solved": stripe_result.get("captcha_solved"),
+                "captcha_solved": stripe_result.get("captcha_solved", False),
                 "network_stats": {
                     "total_requests": stripe_result['network_requests'],
                     "api_calls": len(stripe_result['raw_api_calls']),
                     "requests_with_body": len(requests_only),
                     "responses": len(responses_only),
-                    "errors": stripe_result['network_errors']
+                    "errors": stripe_result['network_errors'],
+                    "frames_checked": stripe_result['frames_checked']
                 },
-                "raw_requests": requests_only,  # Separate requests
-                "raw_responses": responses_only,  # Separate responses
-                "all_api_calls": stripe_result['raw_api_calls']  # Combined chronological order
+                "elements_filled": stripe_result["elements_filled"],
+                "raw_requests": requests_only,
+                "raw_responses": responses_only,
+                "all_api_calls": stripe_result['raw_api_calls']
             }
+            
+            # Add extracted fields if any
+            for key, value in stripe_result.items():
+                if key.startswith("extracted_"):
+                    base_response[key] = value
             
             if stripe_result.get("payment_confirmed"):
                 return {
                     **base_response,
                     "success": True,
                     "message": stripe_result.get("message", "Payment successful"),
-                    "payment_intent_id": stripe_result.get("payment_intent_id"),
-                    "token_id": stripe_result.get("token_id"),
-                    "payment_method_id": stripe_result.get("payment_method_id")
+                    "success_url": stripe_result.get("success_url"),
+                    "transaction_id": stripe_result.get("transaction_id"),
+                    "amount": stripe_result.get("amount")
                 }
             elif stripe_result.get("requires_3ds"):
                 return {
@@ -1025,44 +1277,42 @@ async def run_stripe_automation(url, cc_string, email=None):
                 return {
                     **base_response,
                     "success": False,
-                    "error": stripe_result["error"],
-                    "decline_code": stripe_result.get("decline_code")
+                    "error": stripe_result["error"]
                 }
             else:
                 return {
                     **base_response,
                     "success": False,
-                    "message": "Payment not confirmed - check raw API calls",
-                    "details": {
-                        "filled": filled_status,
-                        "payment_submitted": payment_submitted
-                    }
+                    "message": "Payment not confirmed - check raw API calls"
                 }
                 
-        except Exception as e:
-            print(f"[ERROR] {str(e)}")
-            return {
-                "error": f"Automation failed: {str(e)}",
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        print(f"[CRITICAL ERROR]\n{error_trace}")
+        
+        return {
+            "error": f"Automation failed: {str(e)}",
+            "traceback": error_trace[:500],
+            "partial_results": {
                 "captcha_solved": stripe_result.get("captcha_solved", False),
-                "all_api_calls": stripe_result.get("raw_api_calls", []),
-                "network_stats": {
-                    "total_requests": stripe_result.get('network_requests', 0),
-                    "api_calls": len(stripe_result.get('raw_api_calls', [])),
-                    "errors": stripe_result.get('network_errors', 0)
-                }
+                "network_requests": stripe_result.get("network_requests", 0),
+                "api_calls": len(stripe_result.get("raw_api_calls", [])),
+                "elements_filled": stripe_result.get("elements_filled", {})
             }
-            
-        finally:
-            try:
-                if page:
-                    await page.close()
-                if context:
-                    await context.close()
-                if browser:
-                    await browser.close()
-                print("[CLEANUP] ✓")
-            except:
-                pass
+        }
+        
+    finally:
+        # Cleanup
+        try:
+            if page:
+                await page.close()
+            if context:
+                await context.close()
+            if browser:
+                await browser.close()
+            print("[CLEANUP] ✓")
+        except:
+            print("[CLEANUP] Failed, but continuing")
 
 @app.route('/hrkXstripe', methods=['GET'])
 def stripe_endpoint():
@@ -1076,31 +1326,52 @@ def stripe_endpoint():
     
     print(f"\n{'='*80}")
     print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[URL] {url[:100]}...")
-    print(f"[CC] {cc}")
+    print(f"[URL] {url[:100] if url else 'None'}...")
+    print(f"[CC] {cc if cc else 'None'}")
     print('='*80)
     
     if not url or not cc:
-        return jsonify({"error": "Missing parameters: url and cc"}), 400
+        return jsonify({"error": "Missing required parameters: url and cc"}), 400
+    
+    # Validate URL
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
-        result = loop.run_until_complete(run_stripe_automation(url, cc, email))
+        result = loop.run_until_complete(
+            asyncio.wait_for(
+                run_stripe_automation(url, cc, email),
+                timeout=CONFIG["RESPONSE_TIMEOUT_SECONDS"] + 30
+            )
+        )
+        
+        status_code = 200 if result.get('success') else 400
         print(f"[RESULT] {'✓ SUCCESS' if result.get('success') else '✗ FAILED'}")
-        return jsonify(result), 200 if result.get('success') else 400
+        
+        return jsonify(result), status_code
+        
+    except asyncio.TimeoutError:
+        print("[TIMEOUT] Request exceeded maximum time")
+        return jsonify({"error": "Request timeout", "timeout": True}), 504
+        
     except Exception as e:
         print(f"[SERVER ERROR] {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "type": type(e).__name__}), 500
+        
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except:
+            pass
 
 @app.route('/status', methods=['GET'])
 def status_endpoint():
     return jsonify({
         "status": "online",
-        "version": "5.0-request-body-capture",
+        "version": "6.0-enhanced",
         "features": {
             "hcaptcha": True,
             "2captcha": bool(CONFIG.get("TWOCAPTCHA_API_KEY")),
@@ -1108,18 +1379,33 @@ def status_endpoint():
             "universal_api_capture": True,
             "request_body_logging": CONFIG.get("LOG_REQUEST_BODIES", False),
             "fast_mode": CONFIG.get("FAST_MODE", False),
-            "all_domains": True
+            "all_domains": True,
+            "enhanced_frame_handling": True,
+            "smart_wait": True,
+            "comprehensive_error_handling": True
+        },
+        "config": {
+            "response_timeout": CONFIG["RESPONSE_TIMEOUT_SECONDS"],
+            "max_retries": CONFIG["MAX_RETRIES"],
+            "render_wait": CONFIG["RENDER_WAIT"],
+            "network_idle_timeout": CONFIG["NETWORK_IDLE_TIMEOUT"]
         },
         "timestamp": datetime.now().isoformat()
     })
 
+@app.route('/health', methods=['GET'])
+def health_endpoint():
+    return jsonify({"status": "healthy"}), 200
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
-    print("[SERVER] Stripe Automation v5.0 - Request Body Capture")
+    print("[SERVER] Stripe Automation v6.0 - Enhanced Edition")
     print(f"[PORT] {port}")
+    print(f"[MODE] {'LOCAL' if CONFIG['RUN_LOCAL'] else 'BROWSERLESS'}")
     print(f"[2CAPTCHA] {'Enabled' if CONFIG.get('TWOCAPTCHA_API_KEY') else 'Disabled'}")
-    print(f"[MODE] {'FAST' if CONFIG.get('FAST_MODE') else 'NORMAL'}")
+    print(f"[FAST MODE] {'ON' if CONFIG.get('FAST_MODE') else 'OFF'}")
     print(f"[REQUEST BODIES] {'CAPTURING' if CONFIG.get('LOG_REQUEST_BODIES') else 'DISABLED'}")
     print("="*80)
+    
     app.run(host='0.0.0.0', port=port, debug=False)
