@@ -228,7 +228,7 @@ class UniversalResponseAnalyzer:
             return {"parse_error": str(e), "raw": body_data[:500] if body_data else ""}
     
     def analyze_request(self, url, method, headers, body_text, result_dict):
-        """Analyze outgoing API request"""
+        """Analyze outgoing API request - for logging only"""
         if self.shared_state.captcha_token_found:
             return
 
@@ -239,26 +239,18 @@ class UniversalResponseAnalyzer:
         content_type = headers.get('content-type', '') if headers else ''
         parsed_body = self.parse_request_body(body_text, content_type)
         
-        # Store request data
-        request_data = {
-            "type": "request",
-            "url": url,
-            "domain": domain,
-            "endpoint": endpoint,
-            "method": method,
-            "timestamp": datetime.now().isoformat(),
-            "headers": dict(headers) if headers else {},
-            "body": parsed_body,
-            "body_size": len(body_text) if body_text else 0
-        }
-        
-        result_dict["raw_api_calls"].append(request_data)
-        
-        # Log important requests with body
+        # Log important requests for debugging (not stored in result)
         is_payment_api = any(term in url.lower() for term in [
             'stripe', 'payment', 'checkout', 'charge', 'token', 
             'card', 'pay', 'billing', 'purchase', 'transaction', 'order'
         ])
+        
+        if CONFIG['LOG_REQUEST_BODIES'] and (is_payment_api or method in ['POST', 'PUT', 'PATCH']):
+            print(f"[LOG-REQUEST-{method}] {domain} -> {endpoint[:50]}...")
+            if parsed_body and isinstance(parsed_body, dict):
+                for key in ['card', 'number', 'email', 'amount', 'currency', 'payment_method']:
+                    if key in parsed_body:
+                        print(f"  {key}: {str(parsed_body[key])[:50]}")
     
     def analyze_response(self, url, status, headers, body_text, result_dict):
         """Analyze incoming API response, prioritizing hCaptcha token detection"""
@@ -276,29 +268,26 @@ class UniversalResponseAnalyzer:
             pass
         
         # --- CAPTCHA TOKEN EXTRACTION ---
-        if data and 'hcaptcha.com' in domain.lower() and ('getcaptcha' in url.lower() or 'checksiteconfig' in url.lower()):
+        if data and 'hcaptcha.com' in domain.lower():
             if 'generated_pass_UUID' in data:
                 self.shared_state.captcha_token = data['generated_pass_UUID']
                 self.shared_state.captcha_token_found = True
+                
+                # Store ONLY the hCaptcha token response
+                captcha_response = {
+                    "type": "hcaptcha_token",
+                    "url": url,
+                    "timestamp": datetime.now().isoformat(),
+                    "generated_pass_UUID": data['generated_pass_UUID'],
+                    "full_response": data  # Store the full hCaptcha response
+                }
+                result_dict["hcaptcha_calls"].append(captcha_response)
+                
                 print(f"\n{'#'*80}")
                 print("[CAPTCHA DETECTED] Generated Pass UUID Found!")
                 print(f"TOKEN: {self.shared_state.captcha_token}")
+                print(f"URL: {url}")
                 print(f"{'#'*80}\n")
-                
-                # Store this important response
-                response_data = {
-                    "type": "response",
-                    "url": url,
-                    "domain": domain,
-                    "endpoint": endpoint,
-                    "status": status,
-                    "timestamp": datetime.now().isoformat(),
-                    "headers": dict(headers) if headers else {},
-                    "size": len(body_text) if body_text else 0,
-                    "data": data,
-                    "content_type": content_type
-                }
-                result_dict["raw_api_calls"].append(response_data)
                 
                 # Raise custom exception to stop execution
                 raise CaptchaTokenFound(self.shared_state.captcha_token)
@@ -307,41 +296,22 @@ class UniversalResponseAnalyzer:
         if self.shared_state.captcha_token_found:
             return
 
-        # Normal response processing
-        response_data = {
-            "type": "response",
-            "url": url,
-            "domain": domain,
-            "endpoint": endpoint,
-            "status": status,
-            "timestamp": datetime.now().isoformat(),
-            "headers": dict(headers) if headers else {},
-            "size": len(body_text) if body_text else 0
-        }
+        # Log responses for debugging only (not stored in final result)
+        is_payment_api = any(term in url.lower() for term in [
+            'stripe', 'payment', 'checkout', 'charge', 'token', 
+            'card', 'pay', 'billing', 'purchase', 'transaction'
+        ])
         
-        if content_type == "json":
-            response_data["data"] = data
-            response_data["content_type"] = "json"
-        else:
-            response_data["data"] = body_text[:1000] if body_text else ""
-            response_data["content_type"] = "text"
-        
-        # Store in raw responses
-        result_dict["raw_api_calls"].append(response_data)
-        
-        # Analyze for payment success
-        if content_type == "json":
-            # Check for errors
-            error_fields = ['error', 'error_message', 'message', 'decline_reason', 'failure_reason']
-            for field in error_fields:
-                if field in data and data[field]:
-                    result_dict["error"] = str(data[field])
-                    result_dict["success"] = False
-                    break
-            
-            # 3DS detection
-            if any(term in str(data).lower() for term in ['3d', 'authentication', 'verify', 'challenge']):
-                result_dict["requires_3ds"] = True
+        if is_payment_api or status >= 400:
+            print(f"[LOG-RESPONSE-{status}] {domain} -> {endpoint[:50]}...")
+            if content_type == "json" and data:
+                # Log errors
+                for field in ['error', 'error_message', 'message', 'decline_reason']:
+                    if field in data and data[field]:
+                        print(f"  {field}: {data[field]}")
+                        result_dict["error"] = str(data[field])
+                        result_dict["success"] = False
+                        break
 
 def rate_limit_check():
     now = time.time()
@@ -471,18 +441,14 @@ async def run_stripe_automation(url, cc_string, email=None):
     print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
     print(f"[CARD] {card['number']} | {card['month']}/{card['year']} | {card['cvv']}")
     print(f"[EMAIL] {email}")
-    print(f"[MODE] {'FAST' if CONFIG['FAST_MODE'] else 'NORMAL'} (Halt on Token)")
+    print(f"[MODE] {'FAST' if CONFIG['FAST_MODE'] else 'NORMAL'} (Capture HCaptcha Token)")
     print('='*80)
     
     stripe_result = {
         "status": "pending",
-        "raw_api_calls": [],
-        "payment_confirmed": False,
-        "token_created": False,
-        "payment_method_created": False,
-        "payment_intent_created": False,
-        "success_url": None,
-        "requires_3ds": False,
+        "hcaptcha_calls": [],  # Only store hCaptcha related calls
+        "success": False,
+        "error": None,
         "captcha_solved": False,
         "network_requests": 0,
         "network_errors": 0
@@ -569,11 +535,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                         Promise.resolve({ state: Notification.permission }) :
                         originalQuery(parameters)
                 );
-                
-                // Ensure all iframes load properly
-                window.addEventListener('message', function(e) {
-                    // console.log('Frame message:', e.origin, e.data);
-                }, false);
             """)
             
             page = await context.new_page()
@@ -619,7 +580,8 @@ async def run_stripe_automation(url, cc_string, email=None):
                         # Token found, stop processing
                         return
                     except Exception as e:
-                        analyzer.analyze_response(url, status, headers, "", stripe_result)
+                        # Log error but don't store in result
+                        print(f"[LOG-ERROR] Response processing: {str(e)[:50]}")
                         
                 except CaptchaTokenFound:
                     return
@@ -630,6 +592,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                 if shared_state.captcha_token_found:
                     return
                 stripe_result["network_errors"] += 1
+                print(f"[LOG-FAILED] {request.url[:50]}...")
             
             # Attach handlers
             page.on("request", capture_request)
@@ -652,9 +615,6 @@ async def run_stripe_automation(url, cc_string, email=None):
                 # Wait for dynamic content
                 await wait_for_network_idle(page, 5000)
                 
-                # Ensure all frames are loaded
-                frames = page.frames
-                
                 # Wait for lazy-loaded content
                 await safe_wait(page, 2000 if CONFIG['FAST_MODE'] else 3000)
                 
@@ -676,15 +636,13 @@ async def run_stripe_automation(url, cc_string, email=None):
                 # Check if token was found
                 if shared_state.captcha_token_found:
                     print(f"\n[FINAL RESULT] CAPTCHA Token Successfully Captured!")
-                    print(f"Token: {shared_state.captcha_token}")
                     return {
                         "success": True,
                         "action": "CAPTCHA_TOKEN_CAPTURED",
                         "generated_pass_UUID": shared_state.captcha_token,
-                        "all_api_calls": stripe_result['raw_api_calls'],
+                        "hcaptcha_data": stripe_result['hcaptcha_calls'],  # Only hCaptcha data
                         "network_stats": {
                             "total_requests": stripe_result['network_requests'],
-                            "api_calls": len(stripe_result['raw_api_calls']),
                             "errors": stripe_result['network_errors']
                         }
                     }
@@ -713,6 +671,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                                 await element.fill("")
                                 await element.type(email, delay=20 if CONFIG['FAST_MODE'] else 50)
                                 email_filled = True
+                                print(f"[FORM] Email filled: {email}")
                                 break
                     except:
                         continue
@@ -720,6 +679,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                 await safe_wait(page, 500 if CONFIG['FAST_MODE'] else 1500)
                 
                 # Fill card details
+                print("[FORM] Filling card details...")
                 filled_status = {"card": False, "expiry": False, "cvc": False, "name": False}
                 
                 # Fill name
@@ -739,6 +699,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                                 await element.click()
                                 await element.fill(random_name)
                                 filled_status["name"] = True
+                                print(f"[FORM] Name filled: {random_name}")
                                 break
                 except:
                     pass
@@ -785,6 +746,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                                             for digit in card['number']:
                                                 await element.type(digit, delay=typing_delay)
                                             filled_status["card"] = True
+                                            print(f"[FORM] Card number filled")
                                             break
                                     except:
                                         continue
@@ -811,6 +773,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                                             for char in exp_string:
                                                 await element.type(char, delay=typing_delay)
                                             filled_status["expiry"] = True
+                                            print(f"[FORM] Expiry filled")
                                             break
                                     except:
                                         continue
@@ -838,6 +801,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                                             for digit in card['cvv']:
                                                 await element.type(digit, delay=typing_delay)
                                             filled_status["cvc"] = True
+                                            print(f"[FORM] CVC filled")
                                             break
                                     except:
                                         continue
@@ -846,6 +810,8 @@ async def run_stripe_automation(url, cc_string, email=None):
                     
                     if not all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
                         await safe_wait(page, 500 if CONFIG['FAST_MODE'] else 1000)
+                
+                print(f"[FORM] Status: Card={filled_status['card']}, Exp={filled_status['expiry']}, CVC={filled_status['cvc']}")
                 
                 # Wait for validation
                 await safe_wait(page, 1500 if CONFIG['FAST_MODE'] else 3000)
@@ -866,20 +832,19 @@ async def run_stripe_automation(url, cc_string, email=None):
                 # Check if token was found
                 if shared_state.captcha_token_found:
                     print(f"\n[FINAL RESULT] CAPTCHA Token Successfully Captured!")
-                    print(f"Token: {shared_state.captcha_token}")
                     return {
                         "success": True,
                         "action": "CAPTCHA_TOKEN_CAPTURED",
                         "generated_pass_UUID": shared_state.captcha_token,
-                        "all_api_calls": stripe_result['raw_api_calls'],
+                        "hcaptcha_data": stripe_result['hcaptcha_calls'],  # Only hCaptcha data
                         "network_stats": {
                             "total_requests": stripe_result['network_requests'],
-                            "api_calls": len(stripe_result['raw_api_calls']),
                             "errors": stripe_result['network_errors']
                         }
                     }
                 
                 # Submit payment
+                print("[SUBMIT] Looking for submit button...")
                 submit_selectors = [
                     'button[type="submit"]:visible',
                     'button:has-text("pay"):visible',
@@ -904,6 +869,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                                 await btn.scroll_into_view_if_needed()
                                 await btn.click()
                                 payment_submitted = True
+                                print(f"[SUBMIT] ✓ Clicked button")
                                 break
                     except:
                         continue
@@ -911,8 +877,10 @@ async def run_stripe_automation(url, cc_string, email=None):
                 if not payment_submitted and not shared_state.captcha_token_found:
                     await page.keyboard.press('Enter')
                     payment_submitted = True
+                    print("[SUBMIT] ✓ Enter key pressed")
                 
                 # Wait for payment processing
+                print(f"[WAIT] Processing payment...")
                 await safe_wait(page, 10000 if CONFIG['FAST_MODE'] else 15000)
                 await wait_for_network_idle(page, 5000)
                 
@@ -941,56 +909,38 @@ async def run_stripe_automation(url, cc_string, email=None):
                     "success": True,
                     "action": "CAPTCHA_TOKEN_CAPTURED",
                     "generated_pass_UUID": shared_state.captcha_token,
-                    "all_api_calls": stripe_result['raw_api_calls'],
+                    "hcaptcha_data": stripe_result['hcaptcha_calls'],  # Only hCaptcha data
                     "network_stats": {
                         "total_requests": stripe_result['network_requests'],
-                        "api_calls": len(stripe_result['raw_api_calls']),
                         "errors": stripe_result['network_errors']
                     }
                 }
             
-            # Standard flow completion
-            requests_only = [call for call in stripe_result['raw_api_calls'] if call.get('type') == 'request']
-            responses_only = [call for call in stripe_result['raw_api_calls'] if call.get('type') == 'response']
-            
-            base_response = {
-                "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
+            # No token found
+            print("[RESULT] No HCaptcha token found in responses")
+            return {
+                "success": False,
+                "message": "Process complete, no HCaptcha token found",
+                "error": stripe_result.get("error", "No HCaptcha token detected in API responses"),
                 "captcha_solved": stripe_result.get("captcha_solved"),
                 "network_stats": {
                     "total_requests": stripe_result['network_requests'],
-                    "api_calls": len(stripe_result['raw_api_calls']),
-                    "requests_with_body": len(requests_only),
-                    "responses": len(responses_only),
                     "errors": stripe_result['network_errors']
-                },
-                "all_api_calls": stripe_result['raw_api_calls']
+                }
             }
-            
-            if stripe_result.get("payment_confirmed"):
-                return {
-                    **base_response,
-                    "success": True,
-                    "message": "Payment successful (No Captcha token found in API response)",
-                }
-            else:
-                return {
-                    **base_response,
-                    "success": False,
-                    "message": "Process complete, no token found. Check raw calls for status.",
-                    "error": stripe_result.get("error", "No error detected during runtime.")
-                }
                 
         except Exception as e:
+            print(f"[ERROR] {str(e)}")
+            
             # Check for token again
             if shared_state.captcha_token_found:
                 return {
                     "success": True,
                     "action": "CAPTCHA_TOKEN_CAPTURED",
                     "generated_pass_UUID": shared_state.captcha_token,
-                    "all_api_calls": stripe_result['raw_api_calls'],
+                    "hcaptcha_data": stripe_result['hcaptcha_calls'],  # Only hCaptcha data
                     "network_stats": {
                         "total_requests": stripe_result['network_requests'],
-                        "api_calls": len(stripe_result['raw_api_calls']),
                         "errors": stripe_result['network_errors']
                     }
                 }
@@ -999,10 +949,8 @@ async def run_stripe_automation(url, cc_string, email=None):
                 "success": False,
                 "error": f"Automation failed: {str(e)}",
                 "captcha_solved": stripe_result.get("captcha_solved", False),
-                "all_api_calls": stripe_result.get("raw_api_calls", []),
                 "network_stats": {
                     "total_requests": stripe_result.get('network_requests', 0),
-                    "api_calls": len(stripe_result.get('raw_api_calls', [])),
                     "errors": stripe_result.get('network_errors', 0)
                 }
             }
@@ -1015,6 +963,7 @@ async def run_stripe_automation(url, cc_string, email=None):
                     await context.close()
                 if browser:
                     await browser.close()
+                print("[CLEANUP] ✓")
             except:
                 pass
 
@@ -1042,16 +991,15 @@ def stripe_endpoint():
     
     try:
         result = loop.run_until_complete(run_stripe_automation(url, cc, email))
+        
         if result.get('action') == 'CAPTCHA_TOKEN_CAPTURED':
-            print(f"[RESULT] CAPTCHA Token Captured and Outputted.")
+            print(f"\n[SUCCESS] CAPTCHA Token Captured!")
+            print(f"Generated Token: {result['generated_pass_UUID']}")
         else:
             print(f"[RESULT] {'✓ SUCCESS' if result.get('success') else '✗ FAILED'}")
-        
-        # Ensure the token is printed as requested
-        if result.get('generated_pass_UUID'):
-            print(f"Generated Token: {result['generated_pass_UUID']}")
             
         return jsonify(result), 200 if result.get('success') else 400
+        
     except Exception as e:
         print(f"[SERVER ERROR] {e}")
         return jsonify({"error": str(e)}), 500
@@ -1062,15 +1010,12 @@ def stripe_endpoint():
 def status_endpoint():
     return jsonify({
         "status": "online",
-        "version": "5.1-hcaptcha-prioritizer-fixed",
+        "version": "5.2-hcaptcha-only",
         "features": {
-            "hcaptcha": True,
+            "hcaptcha_token_capture": True,
             "2captcha": bool(CONFIG.get("TWOCAPTCHA_API_KEY")),
-            "auto_retry": True,
-            "universal_api_capture": True,
-            "request_body_logging": CONFIG.get("LOG_REQUEST_BODIES", False),
             "fast_mode": CONFIG.get("FAST_MODE", False),
-            "prioritize_captcha_token": True
+            "response_filtering": "hcaptcha_only"
         },
         "timestamp": datetime.now().isoformat()
     })
@@ -1078,10 +1023,11 @@ def status_endpoint():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     print("="*80)
-    print("[SERVER] Stripe Automation v5.1 - HCaptcha Prioritizer (Fixed)")
+    print("[SERVER] Stripe Automation v5.2 - HCaptcha Token Capture Only")
     print(f"[PORT] {port}")
     print(f"[2CAPTCHA] {'Enabled' if CONFIG.get('TWOCAPTCHA_API_KEY') else 'Disabled'}")
     print(f"[MODE] {'FAST' if CONFIG.get('FAST_MODE') else 'NORMAL'}")
-    print(f"[REQUEST BODIES] {'CAPTURING' if CONFIG.get('LOG_REQUEST_BODIES') else 'DISABLED'}")
+    print("[OUTPUT] Only HCaptcha tokens in API response")
+    print("[LOGGING] All other API calls logged to console only")
     print("="*80)
     app.run(host='0.0.0.0', port=port, debug=False)
